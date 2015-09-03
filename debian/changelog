@@ -1,3 +1,15 @@
+python-pykafka (1.1.1-1) unstable; urgency=low
+
+  * Upstream release of 1.1.1
+  * Backport fix of auto_offset_reset=-1 bug: Issue #241
+    auto_offset_reset=-1 with new consumers now does what is expected.
+    This is a behavior breaking change, as pykafka now consumes from
+    the latest offset for new consumers.  The default auto_offset_reset
+    in later upstream has been changed to -2, in order to not change
+    pykafka's behavoir.  This backport leaves the default at -1.
+
+ -- Andrew Otto (WMF) <otto@wikimedia.org>  Thu, 03 Sep 2015 13:02:04 +0000
+
 python-pykafka (1.0.3-1) unstable; urgency=low
 
   * Upstream release of 1.0.3
