@@ -58,7 +58,6 @@ class BalancedConsumer():
                  queued_max_messages=2000,
                  fetch_min_bytes=1,
                  fetch_wait_max_ms=100,
-                 refresh_leader_backoff_ms=200,
                  offsets_channel_backoff_ms=1000,
                  offsets_commit_max_retries=5,
                  auto_offset_reset=OffsetType.LATEST,
@@ -76,20 +75,22 @@ class BalancedConsumer():
         :type topic: :class:`pykafka.topic.Topic`
         :param cluster: The cluster to which this consumer should connect
         :type cluster: :class:`pykafka.cluster.Cluster`
-        :param consumer_group: The name of the consumer group to join
+        :param consumer_group: The name of the consumer group this consumer
+            should join.
         :type consumer_group: str
         :param fetch_message_max_bytes: The number of bytes of messages to
             attempt to fetch with each fetch request
         :type fetch_message_max_bytes: int
-        :param num_consumer_fetchers: The number of threads used to fetch data
+        :param num_consumer_fetchers: The number of workers used to make
+            FetchRequests
         :type num_consumer_fetchers: int
         :param auto_commit_enable: If true, periodically commit to kafka the
             offset of messages already fetched by this consumer. This also
-            requires that consumer_group is not None.
+            requires that `consumer_group` is not `None`.
         :type auto_commit_enable: bool
         :param auto_commit_interval_ms: The frequency (in milliseconds) at which
             the consumer's offsets are committed to kafka. This setting is
-            ignored if auto_commit_enable is False.
+            ignored if `auto_commit_enable` is `False`.
         :type auto_commit_interval_ms: int
         :param queued_max_messages: The maximum number of messages buffered for
             consumption in the internal
@@ -97,15 +98,12 @@ class BalancedConsumer():
         :type queued_max_messages: int
         :param fetch_min_bytes: The minimum amount of data (in bytes) that the
             server should return for a fetch request. If insufficient data is
-            available, the request will block.
+            available, the request will block until sufficient data is available.
         :type fetch_min_bytes: int
         :param fetch_wait_max_ms: The maximum amount of time (in milliseconds)
             that the server will block before answering a fetch request if
-            there isn't sufficient data to immediately satisfy fetch_min_bytes.
+            there isn't sufficient data to immediately satisfy `fetch_min_bytes`.
         :type fetch_wait_max_ms: int
-        :param refresh_leader_backoff_ms: Backoff time (in milliseconds) to
-            refresh the leader of a partition after it loses the current leader.
-        :type refresh_leader_backoff_ms: int
         :param offsets_channel_backoff_ms: Backoff time to retry failed offset
             commits and fetches.
         :type offsets_channel_backoff_ms: int
@@ -114,11 +112,11 @@ class BalancedConsumer():
         :type offsets_commit_max_retries: int
         :param auto_offset_reset: What to do if an offset is out of range. This
             setting indicates how to reset the consumer's internal offset
-            counter when an OffsetOutOfRangeError is encountered.
+            counter when an `OffsetOutOfRangeError` is encountered.
         :type auto_offset_reset: :class:`pykafka.common.OffsetType`
         :param consumer_timeout_ms: Amount of time (in milliseconds) the
             consumer may spend without messages available for consumption
-            before raising an error.
+            before returning None.
         :type consumer_timeout_ms: int
         :param rebalance_max_retries: The number of times the rebalance should
             retry before raising an error.
@@ -141,8 +139,8 @@ class BalancedConsumer():
             can be started with `start()`.
         :type auto_start: bool
         :param reset_offset_on_start: Whether the consumer should reset its
-            internal offset counter to `self._auto_offset_reset` immediately
-            upon starting up
+            internal offset counter to `self._auto_offset_reset` and commit that
+            offset immediately upon starting up
         :type reset_offset_on_start: bool
         """
         self._cluster = cluster
@@ -168,13 +166,18 @@ class BalancedConsumer():
 
         self._rebalancing_lock = cluster.handler.Lock()
         self._consumer = None
-        self._consumer_id = "{}:{}".format(socket.gethostname(), uuid4())
+        self._consumer_id = "{hostname}:{uuid}".format(
+            hostname=socket.gethostname(),
+            uuid=uuid4()
+        )
         self._partitions = set()
         self._setting_watches = True
 
-        self._topic_path = '/consumers/{}/owners/{}'.format(self._consumer_group,
-                                                            self._topic.name)
-        self._consumer_id_path = '/consumers/{}/ids'.format(self._consumer_group)
+        self._topic_path = '/consumers/{group}/owners/{topic}'.format(
+            group=self._consumer_group,
+            topic=self._topic.name)
+        self._consumer_id_path = '/consumers/{group}/ids'.format(
+            group=self._consumer_group)
 
         self._zookeeper = None
         if zookeeper is not None:
@@ -183,11 +186,11 @@ class BalancedConsumer():
             self.start()
 
     def __repr__(self):
-        return "<{}.{} at {} (consumer_group={})>".format(
-            self.__class__.__module__,
-            self.__class__.__name__,
-            hex(id(self)),
-            self._consumer_group
+        return "<{module}.{name} at {id_} (consumer_group={group})>".format(
+            module=self.__class__.__module__,
+            name=self.__class__.__name__,
+            id_=hex(id(self)),
+            group=self._consumer_group
         )
 
     def _setup_checker_worker(self):
@@ -201,6 +204,18 @@ class BalancedConsumer():
             log.debug("Checker thread exiting")
         log.debug("Starting checker thread")
         return self._cluster.handler.spawn(checker)
+
+    @property
+    def partitions(self):
+        return self._consumer.partitions if self._consumer else None
+
+    @property
+    def held_offsets(self):
+        """Return a map from partition id to held offset for each partition"""
+        if not self._consumer:
+            return None
+        return dict((p.partition.id, p.last_offset_consumed)
+                    for p in self._consumer._partitions_by_id.itervalues())
 
     def start(self):
         """Open connections and join a cluster."""
@@ -235,7 +250,7 @@ class BalancedConsumer():
         self._zookeeper = KazooClient(zookeeper_connect, timeout=timeout / 1000)
         self._zookeeper.start()
 
-    def _setup_internal_consumer(self):
+    def _setup_internal_consumer(self, start=True):
         """Instantiate an internal SimpleConsumer.
 
         If there is already a SimpleConsumer instance held by this object,
@@ -265,7 +280,8 @@ class BalancedConsumer():
             offsets_channel_backoff_ms=self._offsets_channel_backoff_ms,
             offsets_commit_max_retries=self._offsets_commit_max_retries,
             auto_offset_reset=self._auto_offset_reset,
-            reset_offset_on_start=reset_offset_on_start
+            reset_offset_on_start=reset_offset_on_start,
+            auto_start=start
         )
 
     def _decide_partitions(self, participants):
@@ -373,7 +389,10 @@ class BalancedConsumer():
         if len(self._topic.partitions) <= len(participants):
             raise KafkaException("Cannot add consumer: more consumers than partitions")
 
-        path = '{}/{}'.format(self._consumer_id_path, self._consumer_id)
+        path = '{path}/{id_}'.format(
+            path=self._consumer_id_path,
+            id_=self._consumer_id
+        )
         self._zookeeper.create(
             path, self._topic.name, ephemeral=True, makepath=True)
 
@@ -467,7 +486,8 @@ class BalancedConsumer():
         all_partitions = self._zookeeper.get_children(self._topic_path)
         for partition_slug in all_partitions:
             owner_id, stat = self._zookeeper.get(
-                '{}/{}'.format(self._topic_path, partition_slug))
+                '{path}/{slug}'.format(
+                    path=self._topic_path, slug=partition_slug))
             if owner_id == self._consumer_id:
                 zk_partition_ids.add(int(partition_slug.split('-')[1]))
         # build a set of partition ids we think we own
@@ -497,18 +517,44 @@ class BalancedConsumer():
         log.debug("Rebalance triggered by topic change")
         self._rebalance()
 
+    def reset_offsets(self, partition_offsets=None):
+        """Reset offsets for the specified partitions
+
+        Issue an OffsetRequest for each partition and set the appropriate
+        returned offset in the OwnedPartition
+
+        :param partition_offsets: (`partition`, `offset`) pairs to reset
+            where `partition` is the partition for which to reset the offset
+            and `offset` is the new offset the partition should have
+        :type partition_offsets: Iterable of
+            (:class:`pykafka.partition.Partition`, int)
+        """
+        if not self._consumer:
+            raise ConsumerStoppedException("Internal consumer is stopped")
+        self._consumer.reset_offsets(partition_offsets=partition_offsets)
+
     def consume(self, block=True):
         """Get one message from the consumer
 
         :param block: Whether to block while waiting for a message
         :type block: bool
         """
+
+        def consumer_timed_out():
+            """Indicates whether the consumer has received messages recently"""
+            if self._consumer_timeout_ms == -1:
+                return False
+            disp = (time.time() - self._last_message_time) * 1000.0
+            return disp > self._consumer_timeout_ms
         message = None
-        while message is None:
+        self._last_message_time = time.time()
+        while message is None and not consumer_timed_out():
             try:
                 message = self._consumer.consume(block=block)
             except ConsumerStoppedException:
                 continue
+            if message:
+                self._last_message_time = time.time()
             if not block:
                 return message
         return message

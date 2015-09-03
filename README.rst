@@ -74,7 +74,10 @@ this, you can use the `BalancedConsumer`.
 .. sourcecode:: python
 
     >>> balanced_consumer = topic.get_balanced_consumer(
-            consumer_group='testgroup', auto_commit_enable=True)
+        consumer_group='testgroup',
+        auto_commit_enable=True,
+        zookeeper_connect='myZkClusterNode1.com:2181,myZkClusterNode2.com:2181/myZkChroot'
+    )
 
 You can have as many `BalancedConsumer` instances consuming a topic as that
 topic has partitions. If they are all connected to the same zookeeper instance,
@@ -100,4 +103,4 @@ Support
 If you need help using PyKafka or have found a bug, please open a `github issue`_ or use the `Google Group`_.
 
 .. _github issue: https://github.com/Parsely/pykafka/issues
-.. _Google Group: pykafka-user@googlegroups.com
+.. _Google Group: https://groups.google.com/forum/#!forum/pykafka-user

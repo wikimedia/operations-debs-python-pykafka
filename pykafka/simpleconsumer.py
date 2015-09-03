@@ -25,22 +25,23 @@ import threading
 from collections import defaultdict
 from Queue import Queue, Empty
 
-import base
 from .common import OffsetType
 from .utils.compat import Semaphore
 from .exceptions import (OffsetOutOfRangeError, UnknownTopicOrPartition,
                          OffsetMetadataTooLarge, OffsetsLoadInProgress,
                          NotCoordinatorForConsumer, SocketDisconnectedError,
-                         ConsumerStoppedException, ERROR_CODES)
+                         ConsumerStoppedException, KafkaException,
+                         OffsetRequestFailedError, ERROR_CODES)
 from .protocol import (PartitionFetchRequest, PartitionOffsetCommitRequest,
                        PartitionOffsetFetchRequest, PartitionOffsetRequest)
-from .utils.error_handlers import handle_partition_responses, raise_error
+from .utils.error_handlers import (handle_partition_responses, raise_error,
+                                   build_parts_by_error)
 
 
 log = logging.getLogger(__name__)
 
 
-class SimpleConsumer(base.BaseSimpleConsumer):
+class SimpleConsumer():
     """
     A non-balancing consumer for Kafka
     """
@@ -56,7 +57,6 @@ class SimpleConsumer(base.BaseSimpleConsumer):
                  queued_max_messages=2000,
                  fetch_min_bytes=1,
                  fetch_wait_max_ms=100,
-                 refresh_leader_backoff_ms=200,
                  offsets_channel_backoff_ms=1000,
                  offsets_commit_max_retries=5,
                  auto_offset_reset=OffsetType.LATEST,
@@ -75,35 +75,36 @@ class SimpleConsumer(base.BaseSimpleConsumer):
         :type topic: :class:`pykafka.topic.Topic`
         :param cluster: The cluster to which this consumer should connect
         :type cluster: :class:`pykafka.cluster.Cluster`
-        :param consumer_group: The name of the consumer group to join
+        :param consumer_group: The name of the consumer group this consumer
+            should use for offset committing and fetching.
         :type consumer_group: str
         :param partitions: Existing partitions to which to connect
         :type partitions: Iterable of :class:`pykafka.partition.Partition`
         :param fetch_message_max_bytes: The number of bytes of messages to
             attempt to fetch
         :type fetch_message_max_bytes: int
-        :param num_consumer_fetchers: The number of workers used to fetch data
+        :param num_consumer_fetchers: The number of workers used to make
+            FetchRequests
         :type num_consumer_fetchers: int
         :param auto_commit_enable: If true, periodically commit to kafka the
-            offset of messages already fetched by this consumer.
+            offset of messages already fetched by this consumer. This also
+            requires that `consumer_group` is not `None`.
         :type auto_commit_enable: bool
         :param auto_commit_interval_ms: The frequency (in milliseconds) at which the
-            consumer offsets are committed to kafka
+            consumer offsets are committed to kafka. This setting is ignored if
+            `auto_commit_enable` is `False`.
         :type auto_commit_interval_ms: int
         :param queued_max_messages: Maximum number of messages buffered for
             consumption
         :type queued_max_messages: int
         :param fetch_min_bytes: The minimum amount of data (in bytes) the server
             should return for a fetch request. If insufficient data is available
-            the request will block.
+            the request will block until sufficient data is available.
         :type fetch_min_bytes: int
         :param fetch_wait_max_ms: The maximum amount of time (in milliseconds)
             the server will block before answering the fetch request if there
-            isn't sufficient data to immediately satisfy fetch_min_bytes.
+            isn't sufficient data to immediately satisfy `fetch_min_bytes`.
         :type fetch_wait_max_ms: int
-        :param refresh_leader_backoff_ms: Backoff time (in milliseconds) to
-            refresh the leader of a partition after it loses the current leader.
-        :type refresh_leader_backoff_ms: int
         :param offsets_channel_backoff_ms: Backoff time (in milliseconds) to
             retry offset commits/fetches
         :type offsets_channel_backoff_ms: int
@@ -112,19 +113,19 @@ class SimpleConsumer(base.BaseSimpleConsumer):
         :type offsets_commit_max_retries: int
         :param auto_offset_reset: What to do if an offset is out of range. This
             setting indicates how to reset the consumer's internal offset
-            counter when an OffsetOutOfRangeError is encountered.
+            counter when an `OffsetOutOfRangeError` is encountered.
         :type auto_offset_reset: :class:`pykafka.common.OffsetType`
         :param consumer_timeout_ms: Amount of time (in milliseconds) the
             consumer may spend without messages available for consumption
-            before raising an error.
+            before returning None.
         :type consumer_timeout_ms: int
         :param auto_start: Whether the consumer should begin communicating
             with kafka after __init__ is complete. If false, communication
             can be started with `start()`.
         :type auto_start: bool
         :param reset_offset_on_start: Whether the consumer should reset its
-            internal offset counter to `self._auto_offset_reset` immediately
-            upon starting up
+            internal offset counter to `self._auto_offset_reset` and commit that
+            offset immediately upon starting up
         :type reset_offset_on_start: bool
         """
         self._cluster = cluster
@@ -156,19 +157,19 @@ class SimpleConsumer(base.BaseSimpleConsumer):
         self._discover_offset_manager()
 
         if partitions:
-            self._partitions = {OwnedPartition(p, self._messages_arrived): p
-                                for p in partitions}
+            self._partitions = dict((p, OwnedPartition(p, self._messages_arrived))
+                                    for p in partitions)
         else:
-            self._partitions = {OwnedPartition(p, self._messages_arrived):
-                                topic.partitions[k]
-                                for k, p in topic.partitions.iteritems()}
-        self._partitions_by_id = {p.partition.id: p
-                                  for p in self._partitions.iterkeys()}
+            self._partitions = dict((topic.partitions[k],
+                                     OwnedPartition(p, self._messages_arrived))
+                                    for k, p in topic.partitions.iteritems())
+        self._partitions_by_id = dict((p.partition.id, p)
+                                      for p in self._partitions.itervalues())
         # Organize partitions by leader for efficient queries
         self._partitions_by_leader = defaultdict(list)
-        for p in self._partitions.iterkeys():
+        for p in self._partitions.itervalues():
             self._partitions_by_leader[p.partition.leader].append(p)
-        self.partition_cycle = itertools.cycle(self._partitions.keys())
+        self.partition_cycle = itertools.cycle(self._partitions.values())
 
         self._default_error_handlers = self._build_default_error_handlers()
 
@@ -177,11 +178,11 @@ class SimpleConsumer(base.BaseSimpleConsumer):
             self.start()
 
     def __repr__(self):
-        return "<{}.{} at {} (consumer_group={})>".format(
-            self.__class__.__module__,
-            self.__class__.__name__,
-            hex(id(self)),
-            self._consumer_group
+        return "<{module}.{name} at {id_} (consumer_group={group})>".format(
+            module=self.__class__.__module__,
+            name=self.__class__.__name__,
+            id_=hex(id(self)),
+            group=self._consumer_group
         )
 
     def start(self):
@@ -194,9 +195,7 @@ class SimpleConsumer(base.BaseSimpleConsumer):
 
         # Figure out which offset wer're starting on
         if self._reset_offset_on_start:
-            self._reset_offsets()
-            # make sure the reset is saved in kafka before it can rebalance
-            self.commit_offsets()
+            self.reset_offsets()
         elif self._consumer_group is not None:
             self.fetch_offsets()
 
@@ -208,8 +207,11 @@ class SimpleConsumer(base.BaseSimpleConsumer):
     def _build_default_error_handlers(self):
         """Set up the error handlers to use for partition errors."""
         def _handle_OffsetOutOfRangeError(parts):
-            self._reset_offsets([owned_partition
-                                 for owned_partition, pres in parts])
+            log.info("Resetting offsets in response to OffsetOutOfRangeError")
+            self.reset_offsets(
+                partition_offsets=[(owned_partition.partition, self._auto_offset_reset)
+                                   for owned_partition, pres in parts]
+            )
 
         def _handle_NotCoordinatorForConsumer(parts):
             self._discover_offset_manager()
@@ -237,7 +239,14 @@ class SimpleConsumer(base.BaseSimpleConsumer):
     @property
     def partitions(self):
         """A list of the partitions that this consumer consumes"""
-        return self._partitions
+        return dict((id_, partition.partition)
+                    for id_, partition in self._partitions_by_id.iteritems())
+
+    @property
+    def held_offsets(self):
+        """Return a map from partition id to held offset for each partition"""
+        return dict((p.partition.id, p.last_offset_consumed)
+                    for p in self._partitions_by_id.itervalues())
 
     def __del__(self):
         """Stop consumption and workers when object is deleted"""
@@ -317,7 +326,8 @@ class SimpleConsumer(base.BaseSimpleConsumer):
         if (time.time() - self._last_auto_commit) * 1000.0 >= self._auto_commit_interval_ms:
             log.info("Autocommitting consumer offset for consumer group %s and topic %s",
                      self._consumer_group, self._topic.name)
-            self.commit_offsets()
+            if self._consumer_group is not None:
+                self.commit_offsets()
             self._last_auto_commit = time.time()
 
     def commit_offsets(self):
@@ -328,7 +338,7 @@ class SimpleConsumer(base.BaseSimpleConsumer):
         if not self._consumer_group:
             raise Exception("consumer group must be specified to commit offsets")
 
-        reqs = [p.build_offset_commit_request() for p in self._partitions.keys()]
+        reqs = [p.build_offset_commit_request() for p in self._partitions.values()]
         log.debug("Committing offsets for %d partitions to broker id %s", len(reqs),
                   self._offset_manager.id)
         for i in xrange(self._offsets_commit_max_retries):
@@ -339,15 +349,15 @@ class SimpleConsumer(base.BaseSimpleConsumer):
             response = self._offset_manager.commit_consumer_group_offsets(
                 self._consumer_group, 1, 'pykafka', reqs)
             parts_by_error = handle_partition_responses(
-                response,
                 self._default_error_handlers,
+                response=response,
                 partitions_by_id=self._partitions_by_id)
             if len(parts_by_error) == 1 and 0 in parts_by_error:
                 break
             log.error("Error committing offsets for topic %s (errors: %s)",
                       self._topic.name,
-                      {ERROR_CODES[err]: [op.partition.id for op, _ in parts]
-                       for err, parts in parts_by_error.iteritems()})
+                      dict((ERROR_CODES[err], [op.partition.id for op, _ in parts])
+                           for err, parts in parts_by_error.iteritems()))
 
             # retry only the partitions that errored
             if 0 in parts_by_error:
@@ -374,7 +384,7 @@ class SimpleConsumer(base.BaseSimpleConsumer):
                           pres.offset)
                 owned_partition.set_offset(pres.offset)
 
-        reqs = [p.build_offset_fetch_request() for p in self._partitions.keys()]
+        reqs = [p.build_offset_fetch_request() for p in self._partitions.values()]
         success_responses = []
 
         log.debug("Fetching offsets for %d partitions from broker id %s", len(reqs),
@@ -386,8 +396,8 @@ class SimpleConsumer(base.BaseSimpleConsumer):
 
             res = self._offset_manager.fetch_consumer_group_offsets(self._consumer_group, reqs)
             parts_by_error = handle_partition_responses(
-                res,
                 self._default_error_handlers,
+                response=res,
                 success_handler=_handle_success,
                 partitions_by_id=self._partitions_by_id)
 
@@ -397,8 +407,8 @@ class SimpleConsumer(base.BaseSimpleConsumer):
                 return success_responses
             log.error("Error fetching offsets for topic %s (errors: %s)",
                       self._topic.name,
-                      {ERROR_CODES[err]: [op.partition.id for op, _ in parts]
-                       for err, parts in parts_by_error.iteritems()})
+                      dict((ERROR_CODES[err], [op.partition.id for op, _ in parts])
+                           for err, parts in parts_by_error.iteritems()))
 
             time.sleep(i * (self._offsets_channel_backoff_ms / 1000))
 
@@ -408,59 +418,133 @@ class SimpleConsumer(base.BaseSimpleConsumer):
             to_retry.extend(parts_by_error.get(NotCoordinatorForConsumer.ERROR_CODE, []))
             reqs = [p.build_offset_fetch_request() for p, _ in to_retry]
 
-    def _reset_offsets(self, partitions=None):
-        """Reset offsets after an error
+    def reset_offsets(self, partition_offsets=None):
+        """Reset offsets for the specified partitions
 
         Issue an OffsetRequest for each partition and set the appropriate
-        returned offset in the OwnedPartition per self._auto_offset_reset
+        returned offset in the consumer's internal offset counter.
 
-        :param partitions: the partitions for which to reset offsets
-        :type partitions: Iterable of
-            :class:`pykafka.simpleconsumer.OwnedPartition`
+        :param partition_offsets: (`partition`, `timestamp_or_offset`) pairs to
+            reset where `partition` is the partition for which to reset the offset
+            and `timestamp_or_offset` is EITHER the timestamp of the message
+            whose offset the partition should have OR the new offset the
+            partition should have
+        :type partition_offsets: Iterable of
+            (:class:`pykafka.partition.Partition`, int)
+
+        NOTE: If an instance of `timestamp_or_offset` is treated by kafka as
+        an invalid offset timestamp, this function directly sets the consumer's
+        internal offset counter for that partition to that instance of
+        `timestamp_or_offset`. On the next fetch request, the consumer attempts
+        to fetch messages starting from that offset. See the following link
+        for more information on what kafka treats as a valid offset timestamp:
+        https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-OffsetRequest
         """
         def _handle_success(parts):
             for owned_partition, pres in parts:
-                # offset_latest requests return the next offset to consume,
-                # so account for this here by passing offset - 1
-                owned_partition.set_offset(pres.offset[0] - 1)
+                if len(pres.offset) > 0:
+                    # offset requests return the next offset to consume,
+                    # so account for this here by passing offset - 1
+                    owned_partition.set_offset(pres.offset[0] - 1)
+                else:
+                    # If the number specified in partition_offsets is an invalid
+                    # timestamp value for the partition, kafka does the
+                    # following:
+                    #   returns an empty array in pres.offset
+                    #   returns error code 0
+                    # Here, we detect this case and set the consumer's internal
+                    # offset to that value. Thus, the next fetch request will
+                    # attempt to fetch from that offset. If it succeeds, all is
+                    # well; if not, reset_offsets is called again by the error
+                    # handlers in fetch() and fetching continues from
+                    # self._auto_offset_reset..
+                    # This amounts to a hacky way to support user-specified
+                    # offsets in reset_offsets by working around a bug or bad
+                    # design decision in kafka.
+                    given_offset = owned_partition_offsets[owned_partition]
+                    log.warning(
+                        "Offset reset for partition {id_} to timestamp {offset}"
+                        " failed. Setting partition {id_}'s internal counter"
+                        " to {offset}".format(
+                            id_=owned_partition.partition.id, offset=given_offset))
+                    owned_partition.set_offset(given_offset)
+                # release locks on succeeded partitions to allow fetching
+                # to resume
+                owned_partition.fetch_lock.release()
 
-        if partitions is None:
-            partitions = self._partitions.keys()
+        if partition_offsets is None:
+            partition_offsets = [(a, self._auto_offset_reset)
+                                 for a in self._partitions.keys()]
 
-        log.info("Resetting offsets for %s partitions", len(list(partitions)))
+        # turn Partitions into their corresponding OwnedPartitions
+        try:
+            owned_partition_offsets = dict((self._partitions[p], offset)
+                                           for p, offset in partition_offsets)
+        except KeyError as e:
+            raise KafkaException("Unknown partition supplied to reset_offsets\n%s", e)
+
+        log.info("Resetting offsets for %s partitions", len(list(owned_partition_offsets)))
 
         for i in xrange(self._offsets_reset_max_retries):
             # group partitions by leader
             by_leader = defaultdict(list)
-            for p in partitions:
-                by_leader[p.partition.leader].append(p)
+            for partition, offset in owned_partition_offsets.iteritems():
+                # acquire lock for each partition to stop fetching during offset
+                # reset
+                if partition.fetch_lock.acquire(True):
+                    # empty the queue for this partition to avoid sending
+                    # emitting messages from the old offset
+                    partition.flush()
+                    by_leader[partition.partition.leader].append((partition, offset))
+
+            # reset this dict to prepare it for next retry
+            owned_partition_offsets = {}
 
             # get valid offset ranges for each partition
-            for broker, owned_partitions in by_leader.iteritems():
-                reqs = [owned_partition.build_offset_request(self._auto_offset_reset)
-                        for owned_partition in owned_partitions]
+            for broker, offsets in by_leader.iteritems():
+                reqs = [owned_partition.build_offset_request(offset)
+                        for owned_partition, offset in offsets]
                 response = broker.request_offset_limits(reqs)
                 parts_by_error = handle_partition_responses(
-                    response,
                     self._default_error_handlers,
+                    response=response,
                     success_handler=_handle_success,
                     partitions_by_id=self._partitions_by_id)
 
                 if len(parts_by_error) == 1 and 0 in parts_by_error:
-                    break
+                    continue
                 log.error("Error resetting offsets for topic %s (errors: %s)",
                           self._topic.name,
-                          {ERROR_CODES[err]: [op.partition.id for op, _ in parts]
-                           for err, parts in parts_by_error.iteritems()})
+                          dict((ERROR_CODES[err], [op.partition.id for op, _ in parts])
+                               for err, parts in parts_by_error.iteritems()))
 
                 time.sleep(i * (self._offsets_channel_backoff_ms / 1000))
 
                 if 0 in parts_by_error:
                     parts_by_error.pop(0)
-                partitions = []
-                partitions.extend(
-                    [part for errcode, parts in parts_by_error.iteritems()
-                     for part in parts])
+                errored_partitions = dict(
+                    (part, owned_partition_offsets[part])
+                    for errcode, parts in parts_by_error.iteritems()
+                    for part, _ in parts)
+                owned_partition_offsets = dict(errored_partitions.items() +
+                                               owned_partition_offsets.items())
+
+            for errcode, owned_partitions in parts_by_error.iteritems():
+                if errcode != 0:
+                    for owned_partition in owned_partitions:
+                        owned_partition.fetch_lock.release()
+
+            if len(parts_by_error) == 1 and 0 in parts_by_error:
+                break
+            log.debug("Retrying offset reset")
+
+        if any([a != 0 for a in parts_by_error]):
+            raise OffsetRequestFailedError("reset_offsets failed after %d "
+                                           "retries",
+                                           self._offsets_reset_max_retries)
+
+        if self._consumer_group is not None:
+            self.commit_offsets()
 
     def fetch(self):
         """Fetch new messages for all partitions
@@ -482,7 +566,7 @@ class SimpleConsumer(base.BaseSimpleConsumer):
             partition_reqs = {}
             for owned_partition in owned_partitions:
                 # attempt to acquire lock, just pass if we can't
-                if owned_partition.lock.acquire(False):
+                if owned_partition.fetch_lock.acquire(False):
                     partition_reqs[owned_partition] = None
                     if owned_partition.message_count < self._queued_max_messages:
                         fetch_req = owned_partition.build_fetch_request(
@@ -506,13 +590,29 @@ class SimpleConsumer(base.BaseSimpleConsumer):
                         return
                     else:
                         raise
+
+                parts_by_error = build_parts_by_error(response, self._partitions_by_id)
+                # release the lock in these cases, since resolving the error
+                # requires an offset reset and not releasing the lock would
+                # lead to a deadlock in reset_offsets. For successful requests
+                # or requests with different errors, we still assume that
+                # it's ok to retain the lock since no offset_reset can happen
+                # before this function returns
+                out_of_range = parts_by_error.get(OffsetOutOfRangeError.ERROR_CODE, [])
+                for owned_partition, res in out_of_range:
+                    owned_partition.fetch_lock.release()
+                    # remove them from the dict of partitions to unlock to avoid
+                    # double-unlocking
+                    partition_reqs.pop(owned_partition)
+                # handle the rest of the errors that don't require deadlock
+                # management
                 handle_partition_responses(
-                    response,
                     self._default_error_handlers,
-                    success_handler=_handle_success,
-                    partitions_by_id=self._partitions_by_id)
-            for owned_partition in partition_reqs.iterkeys():
-                owned_partition.lock.release()
+                    parts_by_error=parts_by_error,
+                    success_handler=_handle_success)
+                # unlock the rest of the partitions
+                for owned_partition in partition_reqs.iterkeys():
+                    owned_partition.fetch_lock.release()
 
 
 class OwnedPartition(object):
@@ -536,12 +636,16 @@ class OwnedPartition(object):
         self._messages_arrived = semaphore
         self.last_offset_consumed = 0
         self.next_offset = 0
-        self.lock = threading.Lock()
+        self.fetch_lock = threading.Lock()
 
     @property
     def message_count(self):
         """Count of messages currently in this partition's internal queue"""
         return self._messages.qsize()
+
+    def flush(self):
+        self._messages = Queue()
+        log.info("Flushed queue for partition %d", self.partition.id)
 
     def set_offset(self, last_offset_consumed):
         """Set the internal offset counters
@@ -553,18 +657,21 @@ class OwnedPartition(object):
         self.last_offset_consumed = last_offset_consumed
         self.next_offset = last_offset_consumed + 1
 
-    def build_offset_request(self, auto_offset_reset):
+    def build_offset_request(self, new_offset):
         """Create a :class:`pykafka.protocol.PartitionOffsetRequest` for this
             partition
 
-        :param auto_offset_reset: What to do if an offset is out of range. This
+        :param new_offset: The offset to which to set this partition. This
             setting indicates how to reset the consumer's internal offset
             counter when an OffsetOutOfRangeError is encountered.
-        :type auto_offset_reset: :class:`pykafka.common.OffsetType`
+            There are two special values. Specify -1 to receive the latest
+            offset (i.e. the offset of the next coming message) and -2 to
+            receive the earliest available offset.
+        :type new_offset: :class:`pykafka.common.OffsetType` or int
         """
         return PartitionOffsetRequest(
             self.partition.topic.name, self.partition.id,
-            auto_offset_reset, 1)
+            new_offset, 1)
 
     def build_fetch_request(self, max_bytes):
         """Create a :class:`pykafka.protocol.FetchPartitionRequest` for this
@@ -619,6 +726,11 @@ class OwnedPartition(object):
                           "less than last_offset_consumed (%s)",
                           message.offset, self.last_offset_consumed)
                 continue
+            message.partition = self.partition
+            if message.partition_id != self.partition.id:
+                log.error("Partition %s enqueued a message meant for partition %s",
+                          self.partition.id, message.partition_id)
+            message.partition_id = self.partition.id
             self._messages.put(message)
             self.next_offset = message.offset + 1
 
