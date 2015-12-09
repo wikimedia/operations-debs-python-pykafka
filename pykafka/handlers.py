@@ -17,11 +17,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 __all__ = ["ResponseFuture", "Handler", "ThreadingHandler", "RequestHandler"]
-import atexit
-import threading
-import Queue
 
 from collections import namedtuple
+import functools
+import logging
+import threading
+
+from .utils.compat import Queue, Empty
+
+log = logging.getLogger(__name__)
 
 
 class ResponseFuture(object):
@@ -68,10 +72,12 @@ class Handler(object):
 
 class ThreadingHandler(Handler):
     """A handler. that uses a :class:`threading.Thread` to perform its work"""
-    QueueEmptyError = Queue.Empty
-    Queue = Queue.Queue
+    QueueEmptyError = Empty
+    Queue = Queue
     Event = threading.Event
     Lock = threading.Lock
+    # turn off RLock's super annoying default logging
+    RLock = functools.partial(threading.RLock, verbose=False)
 
     def spawn(self, target, *args, **kwargs):
         t = threading.Thread(target=target, *args, **kwargs)
@@ -84,6 +90,7 @@ class RequestHandler(object):
     """Uses a Handler instance to dispatch requests."""
 
     Task = namedtuple('Task', ['request', 'future'])
+    Shared = namedtuple('Shared', ['connection', 'requests', 'ending'])
 
     def __init__(self, handler, connection):
         """
@@ -91,10 +98,15 @@ class RequestHandler(object):
         :type connection: :class:`pykafka.connection.BrokerConnection`
         """
         self.handler = handler
-        self.connection = connection
-        self._requests = handler.Queue()
-        self.ending = handler.Event()
-        atexit.register(self.stop)
+
+        # NB self.shared is referenced directly by _start_thread(), so be careful not to
+        # rebind it
+        self.shared = self.Shared(connection=connection,
+                                  requests=handler.Queue(),
+                                  ending=handler.Event())
+
+    def __del__(self):
+        self.stop()
 
     def request(self, request, has_response=True):
         """Construct a new request
@@ -108,7 +120,7 @@ class RequestHandler(object):
             future = ResponseFuture(self.handler)
 
         task = self.Task(request, future)
-        self._requests.put(task)
+        self.shared.requests.put(task)
         return future
 
     def start(self):
@@ -117,22 +129,37 @@ class RequestHandler(object):
 
     def stop(self):
         """Stop the request processor."""
-        self._requests.join()
-        self.ending.set()
+        shared = self.shared
+        self.shared = None
+        log.info("RequestHandler.stop: about to flush requests queue")
+        shared.requests.join()
+        shared.ending.set()
 
     def _start_thread(self):
         """Run the request processor"""
+        # We pass a direct reference to `shared` into the worker, to avoid
+        # that thread holding a ref to `self`, which would prevent GC.  A
+        # previous version of this used a weakref to `self`, but would
+        # potentially abort the thread before the requests queue was empty
+        shared = self.shared
+
         def worker():
-            while not self.ending.is_set():
-                task = self._requests.get()
+            while not shared.ending.is_set():
                 try:
-                    self.connection.request(task.request)
+                    # set a timeout so we check `ending` every so often
+                    task = shared.requests.get(timeout=1)
+                except Empty:
+                    continue
+                try:
+                    shared.connection.request(task.request)
                     if task.future:
-                        res = self.connection.response()
+                        res = shared.connection.response()
                         task.future.set_response(res)
-                except Exception, e:
+                except Exception as e:
                     if task.future:
                         task.future.set_error(e)
                 finally:
-                    self._requests.task_done()
+                    shared.requests.task_done()
+            log.info("RequestHandler worker: exiting cleanly")
+
         return self.handler.spawn(worker)

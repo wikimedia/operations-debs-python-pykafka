@@ -40,8 +40,23 @@ class ConsumerStoppedException(KafkaException):
     pass
 
 
+class NoPartitionsForConsumerException(ConsumerStoppedException):
+    """Indicates that this consumer is stopped because it assigned itself zero partitions"""
+    pass
+
+
 class NoMessagesConsumedError(KafkaException):
     """Indicates that no messages were returned from a MessageSet"""
+    pass
+
+
+class ProducerQueueFullError(KafkaException):
+    """Indicates that one or more of the AsyncProducer's internal queues contain at least max_queued_messages messages"""
+    pass
+
+
+class ProducerStoppedException(KafkaException):
+    """Raised when the Producer is used while not running"""
     pass
 
 
@@ -172,3 +187,22 @@ ERROR_CODES = dict(
                 ConsumerCoordinatorNotAvailable,
                 NotCoordinatorForConsumer)
 )
+
+
+class RdKafkaException(KafkaException):
+    """Error in rdkafka extension that hasn't any equivalent pykafka exception
+
+    In `pykafka.rdkafka._rd_kafka` we try hard to emit the same exceptions
+    that the pure pykafka classes emit.  This is a fallback for the few cases
+    where we can't find a suitable exception
+    """
+    pass
+
+
+class RdKafkaStoppedException(RdKafkaException):
+    """Consumer or producer handle was stopped
+
+    Raised by the C extension, to be translated to ConsumerStoppedException or
+    ProducerStoppedException by the caller
+    """
+    pass

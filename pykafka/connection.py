@@ -24,6 +24,7 @@ import struct
 
 from .exceptions import SocketDisconnectedError
 from .utils.socket import recvall_into
+from .utils.compat import buffer
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +35,12 @@ class BrokerConnection(object):
     and handles the sending and receiving of data that conform to the
     kafka binary protocol over that socket.
     """
-    def __init__(self, host, port, buffer_size=1024 * 1024):
+    def __init__(self,
+                 host,
+                 port,
+                 buffer_size=1024 * 1024,
+                 source_host='',
+                 source_port=0):
         """Initialize a socket connection to Kafka.
 
         :param host: The host to which to connect
@@ -44,11 +50,19 @@ class BrokerConnection(object):
         :param buffer_size: The size (in bytes) of the buffer in which to
             hold response data.
         :type buffer_size: int
+        :param source_host: The host portion of the source address for
+            the socket connection
+        :type source_host: str
+        :param source_port: The port portion of the source address for
+            the socket connection
+        :type source_port: int
         """
         self._buff = bytearray(buffer_size)
         self.host = host
         self.port = port
         self._socket = None
+        self.source_host = source_host
+        self.source_port = source_port
 
     def __del__(self):
         """Close this connection when the object is deleted."""
@@ -61,10 +75,14 @@ class BrokerConnection(object):
 
     def connect(self, timeout):
         """Connect to the broker."""
+        log.debug("Connecting to %s:%s", self.host, self.port)
         self._socket = socket.create_connection(
             (self.host, self.port),
-            timeout=timeout / 1000
+            timeout / 1000,
+            (self.source_host, self.source_port)
         )
+        if self._socket is not None:
+            log.debug("Successfully connected to %s:%s", self.host, self.port)
 
     def disconnect(self):
         """Disconnect from the broker."""
@@ -80,22 +98,38 @@ class BrokerConnection(object):
     def reconnect(self):
         """Disconnect from the broker, then reconnect"""
         self.disconnect()
-        self.connect()
+        self.connect(10 * 1000)
 
     def request(self, request):
         """Send a request over the socket connection"""
-        bytes = request.get_bytes()
+        bytes_ = request.get_bytes()
         if not self._socket:
             raise SocketDisconnectedError
-        self._socket.sendall(bytes)
+        try:
+            self._socket.sendall(bytes_)
+        except SocketDisconnectedError:
+            self.disconnect()
+            raise
 
     def response(self):
         """Wait for a response from the broker"""
-        size = self._socket.recv(4)
-        if len(size) == 0:
-            # Happens when broker has shut down
-            self.disconnect()
-            raise SocketDisconnectedError
+        size = bytes()
+        expected_len = 4  # Size => int32
+        while len(size) != expected_len:
+            try:
+                r = self._socket.recv(expected_len - len(size))
+            except IOError:
+                r = None
+            if r is None or len(r) == 0:
+                # Happens when broker has shut down
+                self.disconnect()
+                raise SocketDisconnectedError
+            size += r
         size = struct.unpack('!i', size)[0]
-        recvall_into(self._socket, self._buff, size)
+        try:
+            recvall_into(self._socket, self._buff, size)
+        except SocketDisconnectedError:
+            self.disconnect()
+            raise
+        # Drop CorrelationId => int32
         return buffer(self._buff[4:4 + size])

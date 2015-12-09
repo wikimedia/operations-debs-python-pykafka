@@ -1,34 +1,49 @@
 language: python
-python:
-  - "2.7"
-
-env:
-  - BROKERS=localhost:9092,localhost:9093,localhost:9094 ZOOKEEPER=localhost:2181 KAFKA_BIN=/home/travis/kafka-bin
+sudo: false
+addons:
+  apt:
+    packages:
+    - libev-dev
+    - libsnappy-dev
+    - zlib1g-dev  # for librdkafka
+matrix:
+  include:
+    - python: 2.7
+      env: TOXENV=py27 BROKERS=localhost:9092,localhost:9093,localhost:9094 ZOOKEEPER=localhost:2181 KAFKA_BIN=/home/travis/kafka-bin
+    - python: 3.4
+      env: TOXENV=py34 BROKERS=localhost:9092,localhost:9093,localhost:9094 ZOOKEEPER=localhost:2181 KAFKA_BIN=/home/travis/kafka-bin
+    - python: 3.5
+      env: TOXENV=py35 BROKERS=localhost:9092,localhost:9093,localhost:9094 ZOOKEEPER=localhost:2181 KAFKA_BIN=/home/travis/kafka-bin
+    - python: pypy
+      env: TOXENV=pypy BROKERS=localhost:9092,localhost:9093,localhost:9094 ZOOKEEPER=localhost:2181 KAFKA_BIN=/home/travis/kafka-bin
 
 notifications:
   email:
     - keith@parsely.com
     - emmett@parsely.com
 
-before_install:
-    - sudo apt-get install -qq libev-dev libsnappy-dev
-
 install:
-    - pip install python-snappy kazoo unittest2 mock nose
-    - pip install python-coveralls coverage nose-cov
-    - pip install testinstances
-    - python setup.py develop
+    - pip install codecov kazoo tox testinstances
+    - wget https://github.com/edenhill/librdkafka/archive/0.8.6.tar.gz
+    - tar -xzf 0.8.6.tar.gz
+    - cd librdkafka-0.8.6/ && ./configure --prefix=$HOME
+    - make && make install && cd -
 
 before_script:
+    - export C_INCLUDE_PATH=$HOME/include:$C_INCLUDE_PATH
+    - export LIBRARY_PATH=$HOME/lib:$LIBRARY_PATH
+    - export LD_LIBRARY_PATH=$HOME/lib:$LD_LIBRARY_PATH
+    - export CFLAGS="-coverage"
     - "python -m pykafka.test.kafka_instance 3 --download-dir /home/travis/kafka-bin &"
     - "sleep 10"
 
 script:
-    - nosetests -v --with-cov --cov pykafka --cover-branches --cov-config  .coveragerc --logging-level=DEBUG
+    - tox
 
 # Calculate coverage on success
 after_success:
-    - coveralls --config_file .coveragerc
+    # in the next release of codecov, these --gcov-args are probably automatic
+    - codecov --gcov-args="-b -c -o $(find . -type f -name '*.gcno' -exec dirname {} \;)"
 
 branches:
   only:

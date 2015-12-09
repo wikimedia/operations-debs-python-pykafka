@@ -22,16 +22,26 @@ from collections import defaultdict
 
 from .balancedconsumer import BalancedConsumer
 from .common import OffsetType
+from .exceptions import LeaderNotAvailable
 from .partition import Partition
 from .producer import Producer
 from .protocol import PartitionOffsetRequest
 from .simpleconsumer import SimpleConsumer
+from .utils.compat import iteritems, itervalues
 
 
 log = logging.getLogger(__name__)
 
 
-class Topic():
+try:
+    from . import rdkafka
+    log.info("Successfully loaded pykafka.rdkafka extension.")
+except ImportError:
+    rdkafka = False
+    log.info("Could not load pykafka.rdkafka extension.", exc_info=True)
+
+
+class Topic(object):
     """
     A Topic is an abstraction over the kafka concept of a topic.
     It contains a dictionary of partitions that comprise it.
@@ -67,12 +77,22 @@ class Topic():
         """A dictionary containing all known partitions for this topic"""
         return self._partitions
 
-    def get_producer(self, **kwargs):
+    def get_producer(self, use_rdkafka=False, **kwargs):
         """Create a :class:`pykafka.producer.Producer` for this topic.
 
         For a description of all available `kwargs`, see the Producer docstring.
         """
-        return Producer(self._cluster, self, **kwargs)
+        if not rdkafka and use_rdkafka:
+            raise ImportError("use_rdkafka requires rdkafka to be installed")
+        Cls = rdkafka.RdKafkaProducer if rdkafka and use_rdkafka else Producer
+        return Cls(self._cluster, self, **kwargs)
+
+    def get_sync_producer(self, **kwargs):
+        """Create a :class:`pykafka.producer.Producer` for this topic.
+
+        For a description of all available `kwargs`, see the Producer docstring.
+        """
+        return Producer(self._cluster, self, sync=True, **kwargs)
 
     def fetch_offset_limits(self, offsets_before, max_offsets=1):
         """Get earliest or latest offset.
@@ -87,12 +107,12 @@ class Topic():
         :type max_offsets: int
         """
         requests = defaultdict(list)  # one request for each broker
-        for part in self.partitions.itervalues():
+        for part in itervalues(self.partitions):
             requests[part.leader].append(PartitionOffsetRequest(
                 self.name, part.id, offsets_before, max_offsets
             ))
         output = {}
-        for broker, reqs in requests.iteritems():
+        for broker, reqs in iteritems(requests):
             res = broker.request_offset_limits(reqs)
             output.update(res.topics[self.name])
         return output
@@ -116,16 +136,18 @@ class Topic():
         # Remove old partitions
         removed = set(self._partitions.keys()) - set(p_metas.keys())
         if len(removed) > 0:
-            log.info('Removing %d partitons', len(removed))
+            log.info('Removing %d partitions', len(removed))
         for id_ in removed:
-            log.debug('Removing partiton %s', self._partitons[id_])
-            self._partitons.pop(id_)
+            log.debug('Removing partition %s', self._partitions[id_])
+            self._partitions.pop(id_)
 
         # Add/update current partitions
         brokers = self._cluster.brokers
         if len(p_metas) > 0:
             log.info("Adding %d partitions", len(p_metas))
-        for id_, meta in p_metas.iteritems():
+        for id_, meta in iteritems(p_metas):
+            if meta.leader not in brokers:
+                raise LeaderNotAvailable()
             if meta.id not in self._partitions:
                 log.debug('Adding partition %s/%s', self.name, meta.id)
                 self._partitions[meta.id] = Partition(
@@ -137,14 +159,25 @@ class Topic():
             else:
                 self._partitions[id_].update(brokers, meta)
 
-    def get_simple_consumer(self, consumer_group=None, **kwargs):
+    def get_simple_consumer(self,
+                            consumer_group=None,
+                            use_rdkafka=False,
+                            **kwargs):
         """Return a SimpleConsumer of this topic
 
         :param consumer_group: The name of the consumer group to join
         :type consumer_group: str
+        :param use_rdkafka: Use librdkafka-backed consumer if available
+        :type use_rdkafka: bool
         """
-        return SimpleConsumer(self, self._cluster,
-                              consumer_group=consumer_group, **kwargs)
+        if not rdkafka and use_rdkafka:
+            raise ImportError("use_rdkafka requires rdkafka to be installed")
+        Cls = (rdkafka.RdKafkaSimpleConsumer
+               if rdkafka and use_rdkafka else SimpleConsumer)
+        return Cls(self,
+                   self._cluster,
+                   consumer_group=consumer_group,
+                   **kwargs)
 
     def get_balanced_consumer(self, consumer_group, **kwargs):
         """Return a BalancedConsumer of this topic
@@ -152,4 +185,7 @@ class Topic():
         :param consumer_group: The name of the consumer group to join
         :type consumer_group: str
         """
+        if "zookeeper_connect" not in kwargs and \
+                self._cluster._zookeeper_connect is not None:
+            kwargs['zookeeper_connect'] = self._cluster._zookeeper_connect
         return BalancedConsumer(self, self._cluster, consumer_group, **kwargs)

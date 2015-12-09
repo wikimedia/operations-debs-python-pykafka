@@ -8,13 +8,14 @@ class TestPartitionInfo(unittest2.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.kafka = get_cluster()
-        cls.topic_name = 'test-data'
+        cls.topic_name = b'test-data'
         cls.kafka.create_topic(cls.topic_name, 3, 2)
         cls.client = KafkaClient(cls.kafka.brokers)
-        cls.producer = cls.client.topics[cls.topic_name].get_producer()
+        topic = cls.client.topics[cls.topic_name]
+        cls.producer = topic.get_producer(min_queued_messages=1)
         cls.total_messages = 99
         for i in range(cls.total_messages):
-            cls.producer.produce(["message %s" % i])
+            cls.producer.produce("message {}".format(i).encode())
 
     @classmethod
     def tearDownClass(cls):
@@ -28,7 +29,7 @@ class TestPartitionInfo(unittest2.TestCase):
     def test_can_get_latest_offset(self):
         partitions = self.client.topics[self.topic_name].partitions
         for partition in partitions.values():
-            self.assertTrue(partition.latest_available_offset())
+            self.assertTrue(partition.latest_available_offset() >= 0)
 
 if __name__ == "__main__":
     unittest2.main()

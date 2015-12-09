@@ -63,6 +63,7 @@ from zlib import crc32
 from .common import CompressionType, Message
 from .exceptions import ERROR_CODES, NoMessagesConsumedError
 from .utils import Serializable, compression, struct_helpers
+from .utils.compat import iteritems, itervalues, buffer
 
 
 log = logging.getLogger(__name__)
@@ -71,7 +72,7 @@ log = logging.getLogger(__name__)
 class Request(Serializable):
     """Base class for all Requests. Handles writing header information"""
     HEADER_LEN = 21  # constant for all messages
-    CLIENT_ID = 'pykafka'
+    CLIENT_ID = b'pykafka'
 
     def _write_header(self, buff, api_version=0, correlation_id=0):
         """Write the header for an outgoing message.
@@ -124,34 +125,55 @@ class Response(object):
 class Message(Message, Serializable):
     """Representation of a Kafka Message
 
-    NOTE: Compression is handled in the protocol because
-          of the way Kafka embeds compressed MessageSets within
-          Messages
+    NOTE: Compression is handled in the protocol because of the way Kafka embeds compressed MessageSets within Messages
 
-    Message => Crc MagicByte Attributes Key Value
-      Crc => int32
-      MagicByte => int8
-      Attributes => int8
-      Key => bytes
-      Value => bytes
+    Specification::
+
+        Message => Crc MagicByte Attributes Key Value
+          Crc => int32
+          MagicByte => int8
+          Attributes => int8
+          Key => bytes
+          Value => bytes
 
     :class:`pykafka.protocol.Message` also contains `partition` and
     `partition_id` fields. Both of these have meaningless default values. When
-    :class:`pykafka.protocol.Message` is used by the producer.
+    :class:`pykafka.protocol.Message` is used by the producer, `partition_id`
+    identifies the Message's destination partition.
     When used in a :class:`pykafka.protocol.FetchRequest`, `partition_id`
     is set to the id of the partition from which the message was sent on
     receipt of the message. In the :class:`pykafka.simpleconsumer.SimpleConsumer`,
     `partition` is set to the :class:`pykafka.partition.Partition` instance
     from which the message was sent.
+
+    :ivar compression_type: Type of compression to use for the message
+    :ivar partition_key: Value used to assign this message to a particular partition.
+    :ivar value: The payload associated with this message
+    :ivar offset: The offset of the message
+    :ivar partition_id: The id of the partition to which this message belongs
+    :ivar delivery_report_q: For use by :class:`pykafka.producer.Producer`
     """
     MAGIC = 0
+
+    __slots__ = [
+        "compression_type",
+        "partition_key",
+        "value",
+        "offset",
+        "partition_id",
+        "partition",
+        "produce_attempt",
+        "delivery_report_q",
+        ]
 
     def __init__(self,
                  value,
                  partition_key=None,
                  compression_type=CompressionType.NONE,
                  offset=-1,
-                 partition_id=-1):
+                 partition_id=-1,
+                 produce_attempt=0,
+                 delivery_report_q=None):
         self.compression_type = compression_type
         self.partition_key = partition_key
         self.value = value
@@ -161,9 +183,14 @@ class Message(Message, Serializable):
         self.partition_id = partition_id
         # self.partition is set by the consumer
         self.partition = None
+        self.produce_attempt = produce_attempt
+        # delivery_report_q is used by the producer
+        self.delivery_report_q = delivery_report_q
 
     def __len__(self):
-        size = 4 + 1 + 1 + 4 + 4 + len(self.value)
+        size = 4 + 1 + 1 + 4 + 4
+        if self.value is not None:
+            size += len(self.value)
         if self.partition_key is not None:
             size += len(self.partition_key)
         return size
@@ -188,19 +215,21 @@ class Message(Message, Serializable):
         :param buff: The buffer to write into
         :param offset: The offset to start the write at
         """
-        if self.partition_key is None:
-            fmt = '!BBii%ds' % len(self.value)
-            args = (self.MAGIC, self.compression_type, -1,
-                    len(self.value), self.value)
-        else:
-            fmt = '!BBi%dsi%ds' % (len(self.partition_key), len(self.value))
-            args = (self.MAGIC, self.compression_type,
-                    len(self.partition_key), self.partition_key,
-                    len(self.value), self.value)
+        # NB a length of 0 means an empty string, whereas -1 means null
+        len_key = -1 if self.partition_key is None else len(self.partition_key)
+        len_value = -1 if self.value is None else len(self.value)
+        fmt = '!BBi%dsi%ds' % (max(len_key, 0), max(len_value, 0))
+        args = (self.MAGIC,
+                self.compression_type,
+                len_key,
+                self.partition_key or b"",
+                len_value,
+                self.value or b"")
         struct.pack_into(fmt, buff, offset + 4, *args)
         fmt_size = struct.calcsize(fmt)
-        crc = crc32(buffer(buff[(offset + 4):(offset + 4 + fmt_size)]))
-        struct.pack_into('!i', buff, offset, crc)
+        data = buffer(buff[(offset + 4):(offset + 4 + fmt_size)])
+        crc = crc32(data) & 0xffffffff
+        struct.pack_into('!I', buff, offset, crc)
 
 
 class MessageSet(Serializable):
@@ -209,12 +238,13 @@ class MessageSet(Serializable):
     This isn't useful outside of direct communications with Kafka, so we
     keep it hidden away here.
 
-    N.B.: MessageSets are not preceded by an int32 like other
-          array elements in the protocol.
+    N.B.: MessageSets are not preceded by an int32 like other array elements in the protocol.
 
-    MessageSet => [Offset MessageSize Message]
-      Offset => int64
-      MessageSize => int32
+    Specification::
+
+        MessageSet => [Offset MessageSize Message]
+          Offset => int64
+          MessageSize => int32
 
     :ivar messages: The list of messages currently in the MessageSet
     :ivar compression_type: compression to use for the messages
@@ -326,11 +356,13 @@ class MessageSet(Serializable):
 class MetadataRequest(Request):
     """Metadata Request
 
-    MetadataRequest => [TopicName]
-      TopicName => string
+    Specification::
+
+        MetadataRequest => [TopicName]
+            TopicName => string
     """
     def __init__(self, topics=None):
-        """Create a new MetadatRequest
+        """Create a new MetadataRequest
 
         :param topics: Topics to query. Leave empty for all available topics.
         """
@@ -371,19 +403,21 @@ PartitionMetadata = namedtuple('PartitionMetadata',
 class MetadataResponse(Response):
     """Response from MetadataRequest
 
-    MetadataResponse => [Broker][TopicMetadata]
-      Broker => NodeId Host Port
-      NodeId => int32
-      Host => string
-      Port => int32
-      TopicMetadata => TopicErrorCode TopicName [PartitionMetadata]
-      TopicErrorCode => int16
-      PartitionMetadata => PartitionErrorCode PartitionId Leader Replicas Isr
-      PartitionErrorCode => int16
-      PartitionId => int32
-      Leader => int32
-      Replicas => [int32]
-      Isr => [int32]
+    Specification::
+
+        MetadataResponse => [Broker][TopicMetadata]
+          Broker => NodeId Host Port
+          NodeId => int32
+          Host => string
+          Port => int32
+          TopicMetadata => TopicErrorCode TopicName [PartitionMetadata]
+          TopicErrorCode => int16
+          PartitionMetadata => PartitionErrorCode PartitionId Leader Replicas Isr
+          PartitionErrorCode => int16
+          PartitionId => int32
+          Leader => int32
+          Replicas => [int32]
+          Isr => [int32]
     """
     def __init__(self, buff):
         """Deserialize into a new Response
@@ -415,11 +449,13 @@ class MetadataResponse(Response):
 class ProduceRequest(Request):
     """Produce Request
 
-    ProduceRequest => RequiredAcks Timeout [TopicName [Partition MessageSetSize MessageSet]]
-      RequiredAcks => int16
-      Timeout => int32
-      Partition => int32
-      MessageSetSize => int32
+    Specification::
+
+        ProduceRequest => RequiredAcks Timeout [TopicName [Partition MessageSetSize MessageSet]]
+          RequiredAcks => int16
+          Timeout => int32
+          Partition => int32
+          MessageSetSize => int32
     """
     def __init__(self,
                  compression_type=CompressionType.NONE,
@@ -429,7 +465,7 @@ class ProduceRequest(Request):
 
         ``required_acks`` determines how many acknowledgement the server waits
         for before returning. This is useful for ensuring the replication factor
-        of published messages. The behavior is:
+        of published messages. The behavior is::
 
             -1: Block until all servers acknowledge
             0: No waiting -- server doesn't even respond to the Produce request
@@ -454,11 +490,11 @@ class ProduceRequest(Request):
     def __len__(self):
         """Length of the serialized message, in bytes"""
         size = self.HEADER_LEN + 2 + 4 + 4  # acks + timeout + len(topics)
-        for topic, parts in self.msets.iteritems():
+        for topic, parts in iteritems(self.msets):
             # topic name
             size += 2 + len(topic) + 4  # topic name + len(parts)
             # partition + mset size + len(mset)
-            size += sum(4 + 4 + len(mset) for mset in parts.itervalues())
+            size += sum(4 + 4 + len(mset) for mset in itervalues(parts))
         return size
 
     @property
@@ -471,8 +507,8 @@ class ProduceRequest(Request):
         """Iterable of all messages in the Request"""
         return itertools.chain.from_iterable(
             mset.messages
-            for topic, partitions in self.msets.iteritems()
-            for partition_id, mset in partitions.iteritems()
+            for topic, partitions in iteritems(self.msets)
+            for partition_id, mset in iteritems(partitions)
         )
 
     def add_message(self, message, topic_name, partition_id):
@@ -497,11 +533,12 @@ class ProduceRequest(Request):
         struct.pack_into('!hii', output, offset,
                          self.required_acks, self.timeout, len(self.msets))
         offset += 10
-        for topic_name, partitions in self.msets.iteritems():
+        for topic_name, partitions in iteritems(self.msets):
             fmt = '!h%dsi' % len(topic_name)
-            struct.pack_into(fmt, output, offset, len(topic_name), topic_name, len(partitions))
+            struct.pack_into(fmt, output, offset, len(topic_name),
+                             topic_name, len(partitions))
             offset += struct.calcsize(fmt)
-            for partition_id, message_set in partitions.iteritems():
+            for partition_id, message_set in iteritems(partitions):
                 mset_len = len(message_set)
                 struct.pack_into('!ii', output, offset, partition_id, mset_len)
                 offset += 8
@@ -523,11 +560,13 @@ ProducePartitionResponse = namedtuple(
 class ProduceResponse(Response):
     """Produce Response. Checks to make sure everything went okay.
 
-    ProduceResponse => [TopicName [Partition ErrorCode Offset]]
-      TopicName => string
-      Partition => int32
-      ErrorCode => int16
-      Offset => int64
+    Specification::
+
+        ProduceResponse => [TopicName [Partition ErrorCode Offset]]
+          TopicName => string
+          Partition => int32
+          ErrorCode => int16
+          Offset => int64
     """
     def __init__(self, buff):
         """Deserialize into a new Response
@@ -572,14 +611,16 @@ class PartitionFetchRequest(_PartitionFetchRequest):
 class FetchRequest(Request):
     """A Fetch request sent to Kafka
 
-    FetchRequest => ReplicaId MaxWaitTime MinBytes [TopicName [Partition FetchOffset MaxBytes]]
-      ReplicaId => int32
-      MaxWaitTime => int32
-      MinBytes => int32
-      TopicName => string
-      Partition => int32
-      FetchOffset => int64
-      MaxBytes => int32
+    Specification::
+
+        FetchRequest => ReplicaId MaxWaitTime MinBytes [TopicName [Partition FetchOffset MaxBytes]]
+          ReplicaId => int32
+          MaxWaitTime => int32
+          MinBytes => int32
+          TopicName => string
+          Partition => int32
+          FetchOffset => int64
+          MaxBytes => int32
     """
     def __init__(self, partition_requests=[], timeout=1000, min_bytes=1024):
         """Create a new fetch request
@@ -617,7 +658,7 @@ class FetchRequest(Request):
         """Length of the serialized message, in bytes"""
         # replica + max wait + min bytes + len(topics)
         size = self.HEADER_LEN + 4 + 4 + 4 + 4
-        for topic, parts in self._reqs.iteritems():
+        for topic, parts in iteritems(self._reqs):
             # topic name + len(parts)
             size += 2 + len(topic) + 4
             # partition + fetch offset + max bytes => for each partition
@@ -641,11 +682,14 @@ class FetchRequest(Request):
         struct.pack_into('!iiii', output, offset,
                          -1, self.timeout, self.min_bytes, len(self._reqs))
         offset += 16
-        for topic_name, partitions in self._reqs.iteritems():
+        for topic_name, partitions in iteritems(self._reqs):
             fmt = '!h%dsi' % len(topic_name)
-            struct.pack_into(fmt, output, offset, len(topic_name), topic_name, len(partitions))
+            struct.pack_into(
+                fmt, output, offset, len(topic_name), topic_name,
+                len(partitions)
+            )
             offset += struct.calcsize(fmt)
-            for partition_id, (fetch_offset, max_bytes) in partitions.iteritems():
+            for partition_id, (fetch_offset, max_bytes) in iteritems(partitions):
                 struct.pack_into('!iqi', output, offset,
                                  partition_id, fetch_offset, max_bytes)
                 offset += 16
@@ -661,12 +705,14 @@ FetchPartitionResponse = namedtuple(
 class FetchResponse(Response):
     """Unpack a fetch response from the server
 
-    FetchResponse => [TopicName [Partition ErrorCode HighwaterMarkOffset MessageSetSize MessageSet]]
-      TopicName => string
-      Partition => int32
-      ErrorCode => int16
-      HighwaterMarkOffset => int64
-      MessageSetSize => int32
+    Specification::
+
+        FetchResponse => [TopicName [Partition ErrorCode HighwaterMarkOffset MessageSetSize MessageSet]]
+          TopicName => string
+          Partition => int32
+          ErrorCode => int16
+          HighwaterMarkOffset => int64
+          MessageSetSize => int32
     """
     def __init__(self, buff):
         """Deserialize into a new Response
@@ -731,12 +777,14 @@ class PartitionOffsetRequest(_PartitionOffsetRequest):
 class OffsetRequest(Request):
     """An offset request
 
-    OffsetRequest => ReplicaId [TopicName [Partition Time MaxNumberOfOffsets]]
-      ReplicaId => int32
-      TopicName => string
-      Partition => int32
-      Time => int64
-      MaxNumberOfOffsets => int32
+    Specification::
+
+        OffsetRequest => ReplicaId [TopicName [Partition Time MaxNumberOfOffsets]]
+          ReplicaId => int32
+          TopicName => string
+          Partition => int32
+          Time => int64
+          MaxNumberOfOffsets => int32
     """
     def __init__(self, partition_requests):
         """Create a new offset request"""
@@ -749,7 +797,7 @@ class OffsetRequest(Request):
         """Length of the serialized message, in bytes"""
         # Header + replicaId + len(topics)
         size = self.HEADER_LEN + 4 + 4
-        for topic, parts in self._reqs.iteritems():
+        for topic, parts in iteritems(self._reqs):
             # topic name + len(parts)
             size += 2 + len(topic) + 4
             # partition + fetch offset + max bytes => for each partition
@@ -772,12 +820,12 @@ class OffsetRequest(Request):
         offset = self.HEADER_LEN
         struct.pack_into('!ii', output, offset, -1, len(self._reqs))
         offset += 8
-        for topic_name, partitions in self._reqs.iteritems():
+        for topic_name, partitions in iteritems(self._reqs):
             fmt = '!h%dsi' % len(topic_name)
             struct.pack_into(fmt, output, offset, len(topic_name),
                              topic_name, len(partitions))
             offset += struct.calcsize(fmt)
-            for pnum, (offsets_before, max_offsets) in partitions.iteritems():
+            for pnum, (offsets_before, max_offsets) in iteritems(partitions):
                 struct.pack_into('!iqi', output, offset,
                                  pnum, offsets_before, max_offsets)
                 offset += 16
@@ -793,11 +841,13 @@ OffsetPartitionResponse = namedtuple(
 class OffsetResponse(Response):
     """An offset response
 
-    OffsetResponse => [TopicName [PartitionOffsets]]
-      PartitionOffsets => Partition ErrorCode [Offset]
-      Partition => int32
-      ErrorCode => int16
-      Offset => int64
+    Specification::
+
+        OffsetResponse => [TopicName [PartitionOffsets]]
+          PartitionOffsets => Partition ErrorCode [Offset]
+          Partition => int32
+          ErrorCode => int16
+          Offset => int64
     """
     def __init__(self, buff):
         """Deserialize into a new Response
@@ -819,8 +869,10 @@ class OffsetResponse(Response):
 class ConsumerMetadataRequest(Request):
     """A consumer metadata request
 
-    ConsumerMetadataRequest => ConsumerGroup
-      ConsumerGroup => string
+    Specification::
+
+        ConsumerMetadataRequest => ConsumerGroup
+            ConsumerGroup => string
     """
     def __init__(self, consumer_group):
         """Create a new consumer metadata request"""
@@ -853,11 +905,13 @@ class ConsumerMetadataRequest(Request):
 class ConsumerMetadataResponse(Response):
     """A consumer metadata response
 
-    ConsumerMetadataResponse => ErrorCode CoordinatorId CoordinatorHost CoordinatorPort
-      ErrorCode => int16
-      CoordinatorId => int32
-      CoordinatorHost => string
-      CoordinatorPort => int32
+    Specification::
+
+        ConsumerMetadataResponse => ErrorCode CoordinatorId CoordinatorHost CoordinatorPort
+            ErrorCode => int16
+            CoordinatorId => int32
+            CoordinatorHost => string
+            CoordinatorPort => int32
     """
     def __init__(self, buff):
         """Deserialize into a new Response
@@ -897,15 +951,17 @@ class PartitionOffsetCommitRequest(_PartitionOffsetCommitRequest):
 class OffsetCommitRequest(Request):
     """An offset commit request
 
-    OffsetCommitRequest => ConsumerGroupId ConsumerGroupGenerationId ConsumerId [TopicName [Partition Offset TimeStamp Metadata]]
-      ConsumerGroupId => string
-      ConsumerGroupGenerationId => int32
-      ConsumerId => string
-      TopicName => string
-      Partition => int32
-      Offset => int64
-      TimeStamp => int64
-      Metadata => string
+    Specification::
+
+        OffsetCommitRequest => ConsumerGroupId ConsumerGroupGenerationId ConsumerId [TopicName [Partition Offset TimeStamp Metadata]]
+            ConsumerGroupId => string
+            ConsumerGroupGenerationId => int32
+            ConsumerId => string
+            TopicName => string
+            Partition => int32
+            Offset => int64
+            TimeStamp => int64
+            Metadata => string
     """
     def __init__(self,
                  consumer_group,
@@ -933,13 +989,13 @@ class OffsetCommitRequest(Request):
         size = self.HEADER_LEN + 2 + len(self.consumer_group)
         # + generation id + string size + consumer_id size + array length
         size += 4 + 2 + len(self.consumer_id) + 4
-        for topic, parts in self._reqs.iteritems():
+        for topic, parts in iteritems(self._reqs):
             # topic name + len(parts)
             size += 2 + len(topic) + 4
             # partition + offset + timestamp => for each partition
             size += (4 + 8 + 8) * len(parts)
             # metadata => for each partition
-            for partition, (_, _, metadata) in parts.iteritems():
+            for partition, (_, _, metadata) in iteritems(parts):
                 size += 2 + len(metadata)
         return size
 
@@ -963,13 +1019,14 @@ class OffsetCommitRequest(Request):
                          self.consumer_group_generation_id,
                          len(self.consumer_id), self.consumer_id,
                          len(self._reqs))
+
         offset += struct.calcsize(fmt)
-        for topic_name, partitions in self._reqs.iteritems():
+        for topic_name, partitions in iteritems(self._reqs):
             fmt = '!h%dsi' % len(topic_name)
             struct.pack_into(fmt, output, offset, len(topic_name),
                              topic_name, len(partitions))
             offset += struct.calcsize(fmt)
-            for pnum, (poffset, timestamp, metadata) in partitions.iteritems():
+            for pnum, (poffset, timestamp, metadata) in iteritems(partitions):
                 fmt = '!iqq'
                 struct.pack_into(fmt, output, offset,
                                  pnum, poffset, timestamp)
@@ -994,10 +1051,12 @@ OffsetCommitPartitionResponse = namedtuple(
 class OffsetCommitResponse(Response):
     """An offset commit response
 
-    OffsetCommitResponse => [TopicName [Partition ErrorCode]]]
-      TopicName => string
-      Partition => int32
-      ErrorCode => int16
+    Specification::
+
+        OffsetCommitResponse => [TopicName [Partition ErrorCode]]]
+            TopicName => string
+            Partition => int32
+            ErrorCode => int16
     """
     def __init__(self, buff):
         """Deserialize into a new Response
@@ -1033,10 +1092,12 @@ class PartitionOffsetFetchRequest(_PartitionOffsetFetchRequest):
 class OffsetFetchRequest(Request):
     """An offset fetch request
 
-    OffsetFetchRequest => ConsumerGroup [TopicName [Partition]]
-      ConsumerGroup => string
-      TopicName => string
-      Partition => int32
+    Specification::
+
+        OffsetFetchRequest => ConsumerGroup [TopicName [Partition]]
+            ConsumerGroup => string
+            TopicName => string
+            Partition => int32
     """
     def __init__(self, consumer_group, partition_requests=[]):
         """Create a new offset fetch request
@@ -1054,7 +1115,7 @@ class OffsetFetchRequest(Request):
         """Length of the serialized message, in bytes"""
         # Header + consumer group + len(topics)
         size = self.HEADER_LEN + 2 + len(self.consumer_group) + 4
-        for topic, parts in self._reqs.iteritems():
+        for topic, parts in iteritems(self._reqs):
             # topic name + len(parts)
             size += 2 + len(topic) + 4
             # partition => for each partition
@@ -1080,7 +1141,7 @@ class OffsetFetchRequest(Request):
                          len(self.consumer_group), self.consumer_group,
                          len(self._reqs))
         offset += struct.calcsize(fmt)
-        for topic_name, partitions in self._reqs.iteritems():
+        for topic_name, partitions in iteritems(self._reqs):
             fmt = '!h%dsi' % len(topic_name)
             struct.pack_into(fmt, output, offset, len(topic_name),
                              topic_name, len(partitions))
@@ -1101,12 +1162,14 @@ OffsetFetchPartitionResponse = namedtuple(
 class OffsetFetchResponse(Response):
     """An offset fetch response
 
-    OffsetFetchResponse => [TopicName [Partition Offset Metadata ErrorCode]]
-      TopicName => string
-      Partition => int32
-      Offset => int64
-      Metadata => string
-      ErrorCode => int16
+    Specification::
+
+        OffsetFetchResponse => [TopicName [Partition Offset Metadata ErrorCode]]
+            TopicName => string
+            Partition => int32
+            Offset => int64
+            Metadata => string
+            ErrorCode => int16
     """
     def __init__(self, buff):
         """Deserialize into a new Response
