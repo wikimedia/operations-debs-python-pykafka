@@ -1,3 +1,11 @@
+python-pykafka (2.1.0-1) unstable; urgency=low
+
+  * Upstream release of 2.1.0
+  * Fix for Issue #241 was merged upstream, so the local patch from
+    this release of 1.1.1 has been removed.
+
+ -- Andrew Otto (WMF) <otto@wikimedia.org>  Wed, 09 Dec 2015 19:21:36 +0000
+
 python-pykafka (1.1.1-1) unstable; urgency=low
 
   * Upstream release of 1.1.1

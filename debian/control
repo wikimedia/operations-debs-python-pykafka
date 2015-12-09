@@ -9,4 +9,3 @@ Package: python-pykafka
 Architecture: all
 Depends: ${misc:Depends}, ${python:Depends}, python-kazoo
 Description: Full-Featured Pure-Python Kafka Client
-
