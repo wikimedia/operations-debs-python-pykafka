@@ -1,3 +1,11 @@
+python-pykafka (2.1.1-1) unstable; urgency=low
+
+  * Upstream release of 2.1.1
+  * Now building with librdkafka support.
+  * Build python3 package as well.
+
+ -- Andrew Otto (WMF) <otto@wikimedia.org>  Wed, 15 Dec 2015 19:35:37 +0000
+
 python-pykafka (2.1.0-1) unstable; urgency=low
 
   * Upstream release of 2.1.0

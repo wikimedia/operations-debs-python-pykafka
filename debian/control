@@ -2,10 +2,21 @@ Source: python-pykafka
 Maintainer:  --Andrew Otto (WMF) <otto@wikimedia.org>
 Section: python
 Priority: optional
-Build-Depends: debhelper (>=8), python-setuptools (>= 0.6b3), python-all (>= 2.6.6-3), debhelper (>= 7)
+Build-Depends: debhelper (>= 9),
+  python-all (>= 2.7), python-setuptools, python-dev,
+  python3-all, python3-setuptools, python3-dev,
+  librdkafka-dev (>= 0.8.6), dh-python
+Homepage: https://github.com/Parsely/pykafka
 Standards-Version: 3.9.3
 
 Package: python-pykafka
-Architecture: all
-Depends: ${misc:Depends}, ${python:Depends}, python-kazoo
+Architecture: any
+Depends: ${misc:Depends}, ${python:Depends}, python-kazoo, python-tabulate, librdkafka1 (>= 0.8.6)
+Provides: ${python:Provides}
+Description: Full-Featured Pure-Python Kafka Client
+
+Package: python3-pykafka
+Architecture: any
+Depends: ${misc:Depends}, ${python3:Depends}, python3-kazoo, python3-tabulate, librdkafka1 (>= 0.8.6)
+Provides: ${python3:Provides}
 Description: Full-Featured Pure-Python Kafka Client
