@@ -133,6 +133,8 @@ class SimpleConsumer(object):
         :type reset_offset_on_start: bool
         """
         self._cluster = cluster
+        if not (isinstance(consumer_group, bytes) or consumer_group is None):
+            raise TypeError("consumer_group must be a bytes object")
         self._consumer_group = consumer_group
         self._topic = topic
         self._fetch_message_max_bytes = fetch_message_max_bytes
@@ -324,8 +326,8 @@ class SimpleConsumer(object):
     def _setup_fetch_workers(self):
         """Start the fetcher threads"""
         # NB this gets overridden in rdkafka.RdKafkaSimpleConsumer
-
         self = weakref.proxy(self)
+
         def fetcher():
             while True:
                 try:
@@ -413,7 +415,7 @@ class SimpleConsumer(object):
 
             try:
                 response = self._offset_manager.commit_consumer_group_offsets(
-                    self._consumer_group, 1, b'pykafka', reqs)
+                    self._consumer_group, -1, b'pykafka', reqs)
             except (SocketDisconnectedError, IOError):
                 log.error("Error committing offsets for topic %s "
                           "(SocketDisconnectedError)",
