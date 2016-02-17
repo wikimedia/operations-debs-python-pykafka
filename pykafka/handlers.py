@@ -19,11 +19,16 @@ limitations under the License.
 __all__ = ["ResponseFuture", "Handler", "ThreadingHandler", "RequestHandler"]
 
 from collections import namedtuple
-import functools
+import gevent
+import gevent.event
+import gevent.lock
+import gevent.queue
+import gevent.coros
 import logging
 import threading
+import time
 
-from .utils.compat import Queue, Empty
+from .utils.compat import Queue, Empty, Semaphore
 
 log = logging.getLogger(__name__)
 
@@ -71,18 +76,44 @@ class Handler(object):
 
 
 class ThreadingHandler(Handler):
-    """A handler. that uses a :class:`threading.Thread` to perform its work"""
-    QueueEmptyError = Empty
+    """A handler that uses a :class:`threading.Thread` to perform its work"""
     Queue = Queue
     Event = threading.Event
     Lock = threading.Lock
-    # turn off RLock's super annoying default logging
-    RLock = functools.partial(threading.RLock, verbose=False)
+    Semaphore = Semaphore
+
+    def sleep(self, seconds=0):
+        time.sleep(seconds)
+
+    # turn off RLock's super annoying default logging if possible
+    def RLock(*args, **kwargs):
+        kwargs['verbose'] = False
+        try:
+            return threading.RLock(*args[1:], **kwargs)
+        except TypeError:
+            kwargs.pop('verbose')
+            return threading.RLock(*args[1:], **kwargs)
 
     def spawn(self, target, *args, **kwargs):
         t = threading.Thread(target=target, *args, **kwargs)
         t.daemon = True
         t.start()
+        return t
+
+
+class GEventHandler(Handler):
+    """A handler that uses a greenlet to perform its work"""
+    Queue = gevent.queue.JoinableQueue
+    Event = gevent.event.Event
+    Lock = gevent.lock.RLock  # fixme
+    RLock = gevent.lock.RLock
+    Semaphore = gevent.coros.Semaphore
+
+    def sleep(self, seconds=0):
+        gevent.sleep(seconds)
+
+    def spawn(self, target, *args, **kwargs):
+        t = gevent.spawn(target, *args, **kwargs)
         return t
 
 

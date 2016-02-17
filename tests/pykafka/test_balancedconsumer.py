@@ -1,14 +1,17 @@
 import math
 import mock
+import platform
+import pytest
 import time
 import unittest2
 from uuid import uuid4
 
 from kazoo.client import KazooClient
+from kazoo.handlers.gevent import SequentialGeventHandler
 
 from pykafka import KafkaClient
 from pykafka.balancedconsumer import BalancedConsumer, OffsetType
-from pykafka.exceptions import NoPartitionsForConsumerException, ConsumerStoppedException
+from pykafka.exceptions import ConsumerStoppedException
 from pykafka.test.utils import get_cluster, stop_cluster
 from pykafka.utils.compat import range, iterkeys, iteritems
 
@@ -101,6 +104,7 @@ class TestBalancedConsumer(unittest2.TestCase):
 class BalancedConsumerIntegrationTests(unittest2.TestCase):
     maxDiff = None
     USE_RDKAFKA = False
+    USE_GEVENT = False
 
     @classmethod
     def setUpClass(cls):
@@ -108,7 +112,7 @@ class BalancedConsumerIntegrationTests(unittest2.TestCase):
         cls.topic_name = uuid4().hex.encode()
         cls.n_partitions = 3
         cls.kafka.create_topic(cls.topic_name, cls.n_partitions, 2)
-        cls.client = KafkaClient(cls.kafka.brokers)
+        cls.client = KafkaClient(cls.kafka.brokers, use_greenlets=cls.USE_GEVENT)
         cls.prod = cls.client.topics[cls.topic_name].get_producer(
             min_queued_messages=1
         )
@@ -118,6 +122,11 @@ class BalancedConsumerIntegrationTests(unittest2.TestCase):
     @classmethod
     def tearDownClass(cls):
         stop_cluster(cls.kafka)
+
+    def get_zk(self):
+        if not self.USE_GEVENT:
+            return KazooClient(self.kafka.zookeeper)
+        return KazooClient(self.kafka.zookeeper, handler=SequentialGeventHandler())
 
     def test_rebalance_callbacks(self):
         def on_rebalance(cns, old_partition_offsets, new_partition_offsets):
@@ -146,6 +155,37 @@ class BalancedConsumerIntegrationTests(unittest2.TestCase):
             self.assertTrue(self.assigned_called)
             for _, offset in iteritems(consumer_a.held_offsets):
                 self.assertEqual(offset, self.offset_reset)
+        finally:
+            try:
+                consumer_a.stop()
+                consumer_b.stop()
+            except:
+                pass
+
+    def test_rebalance_callbacks_surfaces_errors(self):
+        def on_rebalance(cns, old_partition_offsets, new_partition_offsets):
+            raise ValueError("BAD CALLBACK")
+
+        self.assigned_called = False
+        self.offset_reset = 50
+        try:
+            consumer_group = b'test_rebalance_callbacks_error'
+            consumer_a = self.client.topics[self.topic_name].get_balanced_consumer(
+                consumer_group,
+                zookeeper_connect=self.kafka.zookeeper,
+                auto_offset_reset=OffsetType.EARLIEST,
+                post_rebalance_callback=on_rebalance,
+                use_rdkafka=self.USE_RDKAFKA)
+            consumer_b = self.client.topics[self.topic_name].get_balanced_consumer(
+                consumer_group,
+                zookeeper_connect=self.kafka.zookeeper,
+                auto_offset_reset=OffsetType.EARLIEST,
+                use_rdkafka=self.USE_RDKAFKA)
+
+            with pytest.raises(ValueError) as ex:
+                self.wait_for_rebalancing(consumer_a, consumer_b)
+                assert 'BAD CALLBACK' in str(ex.value)
+
         finally:
             try:
                 consumer_a.stop()
@@ -255,17 +295,20 @@ class BalancedConsumerIntegrationTests(unittest2.TestCase):
         consumer.stop()
 
     def test_no_partitions(self):
-        """Ensure a consumer assigned no partitions immediately exits"""
+        """Ensure a consumer assigned no partitions doesn't fail"""
         consumer = self.client.topics[self.topic_name].get_balanced_consumer(
             b'test_no_partitions',
             zookeeper_connect=self.kafka.zookeeper,
             auto_start=False,
+            consumer_timeout_ms=50,
             use_rdkafka=self.USE_RDKAFKA)
         consumer._decide_partitions = lambda p: set()
         consumer.start()
-        self.assertFalse(consumer._running)
-        with self.assertRaises(NoPartitionsForConsumerException):
-            consumer.consume()
+        res = consumer.consume()
+        self.assertEqual(res, None)
+        self.assertTrue(consumer._running)
+        # check that stop() succeeds (cf #313 and #392)
+        consumer.stop()
 
     def test_zk_conn_lost(self):
         """Check we restore zookeeper nodes correctly after connection loss
@@ -273,7 +316,7 @@ class BalancedConsumerIntegrationTests(unittest2.TestCase):
         See also github issue #204.
         """
         check_partitions = lambda c: c._get_held_partitions() == c._partitions
-        zk = KazooClient(self.kafka.zookeeper)
+        zk = self.get_zk()
         zk.start()
         try:
             topic = self.client.topics[self.topic_name]
@@ -283,7 +326,8 @@ class BalancedConsumerIntegrationTests(unittest2.TestCase):
                                                    zookeeper=zk,
                                                    use_rdkafka=self.USE_RDKAFKA)
             self.assertTrue(check_partitions(consumer))
-            zk.stop()  # expires session, dropping all our nodes
+            with consumer._rebalancing_lock:
+                zk.stop()  # expires session, dropping all our nodes
 
             # Start a second consumer on a different zk connection
             other_consumer = topic.get_balanced_consumer(
@@ -323,11 +367,17 @@ class BalancedConsumerIntegrationTests(unittest2.TestCase):
                     and sum(n_parts) == self.n_partitions):
                 break
             else:
-                time.sleep(.2)
+                balanced_consumers[0]._cluster.handler.sleep(.2)
             # check for failed consumers (there'd be no point waiting anymore)
             [cons._raise_worker_exceptions() for cons in balanced_consumers]
         else:
             raise AssertionError("Rebalancing failed")
+
+
+@pytest.mark.skipif(platform.python_implementation() == "PyPy",
+                    reason="Unresolved crashes")
+class BalancedConsumerGEventIntegrationTests(BalancedConsumerIntegrationTests):
+    USE_GEVENT = True
 
 
 if __name__ == "__main__":

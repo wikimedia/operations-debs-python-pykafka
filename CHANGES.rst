@@ -1,6 +1,80 @@
 Changelog
 =========
 
+2.2.0 (2016-1-26)
+----------------
+
+`Compare 2.2.0`_
+
+.. _Compare 2.2.0: https://github.com/Parsely/pykafka/compare/2.1.2...
+
+Minor Version Features
+**********************
+
+* Added support for gevent-based concurrency in pure cpython
+* Allowed ZooKeeper hosts to be specified directly to KafkaClient instead of
+  being treated as a fallback
+
+
+Bug Fixes
+*********
+
+* Fixed a bug causing `RLock`-related crashes in Python 3
+* Used the more stable sha1 hash function as the default for
+  `hashing_partitioner`
+* Fixed a bug in the meaning of `linger_ms` in the producer
+
+
+
+2.1.2 (2016-1-8)
+----------------
+
+`Compare 2.1.2`_
+
+.. _Compare 2.1.2: https://github.com/Parsely/pykafka/compare/2.1.1...70cce0fb59f4d0f6a4e50bb7521d2edb9c1e66fa
+
+Features
+********
+
+* Allowed consumers to run with no partitions
+
+Bug Fixes
+*********
+
+* Fixed a bug causing consumers to hold outdated partition sets
+* Handled some previously uncaught error codes in `SimpleConsumer`
+* Fixed an off-by-one bug in message set fetching
+* Made `consume()` stricter about message ordering and duplication
+
+
+2.1.1 (2015-12-11)
+------------------
+
+`Compare 2.1.1`_
+
+.. _Compare 2.1.1: https://github.com/Parsely/pykafka/compare/2.1.0...e5c320d60246f98afda458b7c7c43dc2c428de46
+
+Features
+********
+
+* Improved unicode-related error reporting in several components
+* Removed the ZooKeeper checker thread from the `BalancedConsumer`
+* Added a test consumer CLI to `kafka_tools`
+
+
+Bug Fixes
+*********
+
+* Fixed a memory leak in the rdkafka-based consumer
+* Fixed offset committing to work against Kafka 0.9
+* Improved the reliability of the Kafka test harness
+
+Miscellaneous
+*************
+
+* Simplified the Travis test matrix to handle testing against multiple Kafka versions
+
+
 2.1.0 (2015-11-25)
 ------------------
 

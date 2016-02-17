@@ -1,5 +1,7 @@
 from contextlib import contextmanager
 import mock
+import platform
+import pytest
 import time
 import unittest2
 from uuid import uuid4
@@ -13,6 +15,7 @@ from pykafka.utils.compat import range, iteritems
 class TestSimpleConsumer(unittest2.TestCase):
     maxDiff = None
     USE_RDKAFKA = False
+    USE_GEVENT = False
 
     @classmethod
     def setUpClass(cls):
@@ -199,15 +202,23 @@ class TestSimpleConsumer(unittest2.TestCase):
             self.assertEqual(current_offsets, latest_offsets)
 
 
+@pytest.mark.skipif(platform.python_implementation() == "PyPy",
+                    reason="Unresolved crashes")
+class TestGEventSimpleConsumer(TestSimpleConsumer):
+    USE_GEVENT = True
+
+
 class TestOwnedPartition(unittest2.TestCase):
     def test_partition_saves_offset(self):
+        offset = 20
         msgval = "test"
         partition = mock.MagicMock()
         op = OwnedPartition(partition)
+        op.next_offset = offset
 
         message = mock.Mock()
         message.value = msgval
-        message.offset = 20
+        message.offset = offset
 
         op.enqueue_messages([message])
         self.assertEqual(op.message_count, 1)
