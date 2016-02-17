@@ -11,12 +11,16 @@ Standards-Version: 3.9.3
 
 Package: python-pykafka
 Architecture: any
-Depends: ${misc:Depends}, ${python:Depends}, python-kazoo, python-tabulate, librdkafka1 (>= 0.8.6)
+Depends: ${misc:Depends}, ${python:Depends},
+  python-kazoo, python-tabulate, python-gevent (>= 1.1b6),
+  librdkafka1 (>= 0.8.6)
 Provides: ${python:Provides}
 Description: Full-Featured Pure-Python Kafka Client
 
 Package: python3-pykafka
 Architecture: any
-Depends: ${misc:Depends}, ${python3:Depends}, python3-kazoo, python3-tabulate, librdkafka1 (>= 0.8.6)
+Depends: ${misc:Depends}, ${python3:Depends},
+  python3-kazoo, python3-tabulate, python3-gevent (>= 1.1b6),
+  librdkafka1 (>= 0.8.6)
 Provides: ${python3:Provides}
 Description: Full-Featured Pure-Python Kafka Client

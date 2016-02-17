@@ -1,3 +1,9 @@
+python-pykafka (2.2.0-2) unstable; urgency=medium
+
+  * Add python-gevent (>= 1.1b6) to Depends
+
+ -- Andrew Otto (WMF) <otto@wikimedia.org>  Wed, 17 Feb 2016 18:14:15 +0000
+
 python-pykafka (2.2.0-1) unstable; urgency=medium
 
   * Upstream release of 2.2.0
