@@ -20,6 +20,7 @@ limitations under the License.
 __all__ = ["Producer"]
 from collections import deque
 import logging
+import platform
 import sys
 import threading
 import traceback
@@ -31,6 +32,7 @@ from .exceptions import (
     KafkaException,
     InvalidMessageSize,
     MessageSizeTooLarge,
+    NoBrokersAvailableError,
     NotLeaderForPartition,
     ProducerQueueFullError,
     ProducerStoppedException,
@@ -38,7 +40,8 @@ from .exceptions import (
 )
 from .partitioners import random_partitioner
 from .protocol import Message, ProduceRequest
-from .utils.compat import iteritems, range, itervalues
+from .utils.compat import iteritems, itervalues, Empty
+from .utils.error_handlers import valid_int
 
 log = logging.getLogger(__name__)
 
@@ -65,8 +68,10 @@ class Producer(object):
                  min_queued_messages=70000,
                  linger_ms=5 * 1000,
                  block_on_queue_full=True,
+                 max_request_size=1000012,
                  sync=False,
-                 delivery_reports=False):
+                 delivery_reports=False,
+                 auto_start=True):
         """Instantiate a new AsyncProducer
 
         :param cluster: The cluster to which to connect
@@ -78,10 +83,16 @@ class Producer(object):
         :param compression: The type of compression to use.
         :type compression: :class:`pykafka.common.CompressionType`
         :param max_retries: How many times to attempt to produce a given batch of
-            messages before raising an error.
+            messages before raising an error. Allowing retries will potentially change
+            the ordering of records because if two records are sent to a single partition,
+            and the first fails and is retried but the second succeeds, then the second
+            record may appear first. If you want to completely disallow message
+            reordering, use `sync=True`.
         :type max_retries: int
         :param retry_backoff_ms: The amount of time (in milliseconds) to
-            back off during produce request retries.
+            back off during produce request retries. This does not equal the total time
+            spent between message send attempts, since that number can be influenced
+            by other kwargs, including `linger_ms` and `socket_timeout_ms`.
         :type retry_backoff_ms: int
         :param required_acks: The number of other brokers that must have
             committed the data to their log and acknowledged this to the leader
@@ -98,7 +109,10 @@ class Producer(object):
         :type max_queued_messages: int
         :param min_queued_messages: The minimum number of messages the producer
             can have waiting in a queue before it flushes that queue to its
-            broker (must be greater than 0).
+            broker (must be greater than 0). This paramater can be used to
+            control the number of messages sent in one batch during async
+            production. This parameter is automatically overridden to 1
+            when `sync=True`.
         :type min_queued_messages: int
         :param linger_ms: This setting gives the upper bound on the delay for
             batching: once the producer gets min_queued_messages worth of
@@ -114,6 +128,13 @@ class Producer(object):
             indicates we should block until space is available in the queue.
             If False, we should throw an error immediately.
         :type block_on_queue_full: bool
+        :param max_request_size:
+            The maximum size of a request in bytes. This is also effectively a
+            cap on the maximum record size. Note that the server has its own
+            cap on record size which may be different from this. This setting
+            will limit the number of record batches the producer will send in a
+            single request to avoid sending huge requests.
+        :type max_request_size: int
         :param sync: Whether calls to `produce` should wait for the message to
             send before returning.  If `True`, an exception will be raised from
             `produce()` if delivery to kafka failed.
@@ -126,19 +147,30 @@ class Producer(object):
             or an `Exception` in case of failed delivery to kafka.
             This setting is ignored when `sync=True`.
         :type delivery_reports: bool
+        :param auto_start: Whether the producer should begin communicating
+            with kafka after __init__ is complete. If false, communication
+            can be started with `start()`.
+        :type auto_start: bool
         """
         self._cluster = cluster
         self._topic = topic
         self._partitioner = partitioner
         self._compression = compression
-        self._max_retries = max_retries
-        self._retry_backoff_ms = retry_backoff_ms
-        self._required_acks = required_acks
-        self._ack_timeout_ms = ack_timeout_ms
-        self._max_queued_messages = max_queued_messages
-        self._min_queued_messages = max(1, min_queued_messages)
-        self._linger_ms = linger_ms
+        if self._compression == CompressionType.SNAPPY and \
+                platform.python_implementation == "PyPy":
+            log.warning("Caution: python-snappy segfaults when attempting to compress "
+                        "large messages under PyPy")
+        self._max_retries = valid_int(max_retries, allow_zero=True)
+        self._retry_backoff_ms = valid_int(retry_backoff_ms)
+        self._required_acks = valid_int(required_acks, allow_zero=True,
+                                        allow_negative=True)
+        self._ack_timeout_ms = valid_int(ack_timeout_ms, allow_zero=True)
+        self._max_queued_messages = valid_int(max_queued_messages, allow_zero=True)
+        self._min_queued_messages = max(1, valid_int(min_queued_messages)
+                                        if not sync else 1)
+        self._linger_ms = valid_int(linger_ms, allow_zero=True)
         self._block_on_queue_full = block_on_queue_full
+        self._max_request_size = valid_int(max_request_size)
         self._synchronous = sync
         self._worker_exception = None
         self._worker_trace_logged = False
@@ -146,9 +178,11 @@ class Producer(object):
         self._delivery_reports = (_DeliveryReportQueue(self._cluster.handler)
                                   if delivery_reports or self._synchronous
                                   else _DeliveryReportNone())
+        self._auto_start = auto_start
         self._running = False
         self._update_lock = self._cluster.handler.Lock()
-        self.start()
+        if self._auto_start:
+            self.start()
 
     def __del__(self):
         log.debug("Finalising {}".format(self))
@@ -217,9 +251,15 @@ class Producer(object):
             for broker in brokers:
                 owned_broker = self._owned_brokers.pop(broker)
                 owned_broker.stop()
-                batch = owned_broker.flush(self._linger_ms)
-                if batch:
+
+                # loop becuase flush is not garentee to empty owned
+                # broker queue
+                while True:
+                    batch = owned_broker.flush(self._linger_ms, self._max_request_size)
+                    if not batch:
+                        break
                     queued_messages.extend(batch)
+
         self._owned_brokers = {}
         for partition in self._topic.partitions.values():
             if partition.leader.id not in self._owned_brokers:
@@ -228,12 +268,36 @@ class Producer(object):
         return queued_messages
 
     def stop(self):
-        """Mark the producer as stopped"""
-        self._running = False
-        self._wait_all()
-        if self._owned_brokers is not None:
-            for owned_broker in self._owned_brokers.values():
-                owned_broker.stop()
+        """Mark the producer as stopped, and wait until all messages to be sent"""
+        def get_queue_readers():
+            if not self._owned_brokers:
+                return []
+            return [owned_broker._queue_reader_worker
+                    for owned_broker in self._owned_brokers.values()
+                    if owned_broker.running]
+
+        def stop_owned_brokers():
+            self._wait_all()
+            if self._owned_brokers is not None:
+                for owned_broker in self._owned_brokers.values():
+                    owned_broker.stop()
+
+        while self._running:
+            queue_readers = get_queue_readers()
+            stop_owned_brokers()
+            if len(queue_readers) == 0:
+                self._running = False
+            else:
+                # The join() here works because new queue readers are spawned during the
+                # execution of the old ones i.e: after a queue reader in its call to
+                # producer._send_request encounters either a SocketDisconnectedError or
+                # NotLeaderForPartition.ERROR_CODE it updates the cluster and sets up
+                # owned_brokers, starting new queue reader threads. Because of this when
+                # we call self.get_queue_readers, we get the newly created queue readers,
+                # and so try to stop and join them etc ... until they all stop WITHOUT
+                # encountering problems in producer._send_request.
+                for queue_reader in queue_readers:
+                    queue_reader.join()
 
     def produce(self, message, partition_key=None):
         """Produce a message.
@@ -264,12 +328,17 @@ class Producer(object):
         self._produce(msg)
 
         if self._synchronous:
-            reported_msg, exc = self.get_delivery_report()
+            while True:
+                self._cluster.handler.sleep()
+                try:
+                    reported_msg, exc = self.get_delivery_report(timeout=1)
+                    break
+                except Empty:
+                    continue
             assert reported_msg is msg
             if exc is not None:
                 raise exc
         self._raise_worker_exceptions()
-        self._cluster.handler.sleep()
 
     def get_delivery_report(self, block=True, timeout=None):
         """Fetch delivery reports for messages produced on the current thread
@@ -278,6 +347,11 @@ class Producer(object):
         (for successful deliveries) or `Exception` (for failed deliveries).
         This interface is only available if you enabled `delivery_reports` on
         init (and you did not use `sync=True`)
+
+        :param block: Whether to block on dequeueing a delivery report
+        :type block: bool
+        :param timeout: How long (in seconds) to block before returning None
+        ;type timeout: int
         """
         try:
             return self._delivery_reports.queue.get(block, timeout)
@@ -312,6 +386,7 @@ class Producer(object):
             required_acks=self._required_acks,
             timeout=self._ack_timeout_ms
         )
+        req.delivered = 0
         for msg in message_batch:
             req.add_message(msg, self._topic.name, msg.partition_id)
         log.debug("Sending %d messages to broker %d",
@@ -328,6 +403,7 @@ class Producer(object):
 
         def mark_as_delivered(message_batch):
             owned_broker.increment_messages_pending(-1 * len(message_batch))
+            req.delivered += len(message_batch)
             for msg in message_batch:
                 self._delivery_reports.put(msg)
 
@@ -349,11 +425,12 @@ class Producer(object):
                     if presponse.err == NotLeaderForPartition.ERROR_CODE:
                         # Update cluster metadata to get new leader
                         self._update()
-                    info = "Produce request for {}/{} to {}:{} failed.".format(
+                    info = "Produce request for {}/{} to {}:{} failed with error code {}.".format(
                         topic,
                         partition,
                         owned_broker.broker.host,
-                        owned_broker.broker.port)
+                        owned_broker.broker.port,
+                        presponse.err)
                     log.warning(info)
                     exc = ERROR_CODES[presponse.err](info)
                     to_retry.extend(
@@ -363,12 +440,18 @@ class Producer(object):
             log.warning('Broker %s:%s disconnected. Retrying.',
                         owned_broker.broker.host,
                         owned_broker.broker.port)
-            self._update()
+            try:
+                self._update()
+            except NoBrokersAvailableError:
+                log.warning("No brokers available")
             to_retry = [
                 (mset, exc)
                 for topic, partitions in iteritems(req.msets)
                 for p_id, mset in iteritems(partitions)
             ]
+
+        log.debug("Successfully sent {}/{} messages to broker {}".format(
+            req.delivered, len(message_batch), owned_broker.broker.id))
 
         if to_retry:
             self._cluster.handler.sleep(self._retry_backoff_ms / 1000)
@@ -382,6 +465,7 @@ class Producer(object):
                 for msg in mset.messages:
                     if (non_recoverable or msg.produce_attempt >= self._max_retries):
                         self._delivery_reports.put(msg, exc)
+                        log.error("Message not delivered!! %r" % exc)
                     else:
                         msg.produce_attempt += 1
                         self._produce(msg)
@@ -419,8 +503,12 @@ class OwnedBroker(object):
     :type messages_pending: int
     :ivar producer: The producer to which this OwnedBroker instance belongs
     :type producer: :class:`pykafka.producer.AsyncProducer`
+    :param auto_start: Whether the OwnedBroker should start flushing all
+        waiting messages and send to kafka after __init__ is complete. If
+        false, communication can be started with `start()`.
+    :type auto_start: bool
     """
-    def __init__(self, producer, broker):
+    def __init__(self, producer, broker, auto_start=True):
         self.producer = weakref.proxy(producer)
         self.broker = broker
         self.lock = self.producer._cluster.handler.RLock()
@@ -429,11 +517,16 @@ class OwnedBroker(object):
         self.queue = deque()
         self.messages_pending = 0
         self.running = True
+        self._auto_start = auto_start
 
+        if self._auto_start:
+            self.start()
+
+    def start(self):
         def queue_reader():
             while self.running:
                 try:
-                    batch = self.flush(self.producer._linger_ms)
+                    batch = self.flush(self.producer._linger_ms, self.producer._max_request_size)
                     if batch:
                         self.producer._send_request(batch, self)
                 except Exception:
@@ -442,8 +535,10 @@ class OwnedBroker(object):
                     break
             log.info("Worker exited for broker %s:%s", self.broker.host,
                      self.broker.port)
-        log.info("Starting new produce worker for broker %s", broker.id)
-        self.producer._cluster.handler.spawn(queue_reader)
+        log.info("Starting new produce worker for broker %s", self.broker.id)
+        name = "pykafka.OwnedBroker.queue_reader for broker {}".format(self.broker.id)
+        self._queue_reader_worker = self.producer._cluster.handler.spawn(
+            queue_reader, name=name)
 
     def stop(self):
         self.running = False
@@ -474,12 +569,15 @@ class OwnedBroker(object):
                 if not self.flush_ready.is_set():
                     self.flush_ready.set()
 
-    def flush(self, linger_ms, release_pending=False):
+    def flush(self, linger_ms, max_request_size, release_pending=False):
         """Pop messages from the end of the queue
 
         :param linger_ms: How long (in milliseconds) to wait for the queue
             to contain messages before flushing
         :type linger_ms: int
+        :param max_request_size: The max size should each batch of messages
+            should be in bytes
+        :type max_request_size: int
         :param release_pending: Whether to decrement the messages_pending
             counter when the queue is flushed. True means that the messages
             popped from the queue will be discarded unless re-enqueued
@@ -488,7 +586,42 @@ class OwnedBroker(object):
         """
         self._wait_for_flush_ready(linger_ms)
         with self.lock:
-            batch = [self.queue.pop() for _ in range(len(self.queue))]
+            batch = []
+            batch_size_in_bytes = 0
+            while len(self.queue) > 0:
+                peeked_message = self.queue[-1]
+
+                if peeked_message and peeked_message.value is not None:
+                    if len(peeked_message) > max_request_size:
+                        exc = MessageSizeTooLarge(
+                            "Message size larger than max_request_size: {}".format(max_request_size)
+                        )
+                        log.warning(exc)
+                        # bind the MessageSizeTooLarge error the delivery
+                        # report and remove it from the producer queue
+                        message = self.queue.pop()
+                        # don't use producer.delivery_report_q here to enable
+                        # integration tests that test the OwnedBroker without a
+                        # Producer
+                        if peeked_message.delivery_report_q is not None:
+                            peeked_message.delivery_report_q.put((message, exc))
+                        # remove from pending message count
+                        self.increment_messages_pending(-1)
+                        continue
+
+                    # test if adding the message would go over the
+                    # max_request_size. if it would, break out of loop
+                    elif batch_size_in_bytes + len(peeked_message) > max_request_size:
+                        log.debug("max_request_size reached. producing batch")
+                        # if we did not fully empty the queue. reset the
+                        # flush_ready so we send another batch immediately
+                        self.flush_ready.set()
+                        break
+
+                message = self.queue.pop()
+                batch_size_in_bytes += len(message)
+                batch.append(message)
+
             if release_pending:
                 self.increment_messages_pending(-1 * len(batch))
             if not self.slot_available.is_set():
